@@ -348,7 +348,7 @@ export function SettingsModal() {
                     <span className="text-[12.5px] text-[#111827] dark:text-[#F3F4F6]">
                       Hide to System Tray on close
                       <span className="block text-[11.5px] text-[#6B7280] dark:text-[#9CA3AF]">
-                        Keeps global shortcut active with minimal background RAM.
+                        Keeps global shortcut active for instant (&lt;20 ms) reopen while automatically trimming idle Windows working-set RAM.
                       </span>
                     </span>
                   </label>
@@ -364,9 +364,9 @@ export function SettingsModal() {
                       className="mt-0.5 accent-[#2563EB]"
                     />
                     <span className="text-[12.5px] text-[#111827] dark:text-[#F3F4F6]">
-                      Unload WebView2 when hidden to tray
+                      Ultra-Low RAM (rebuilds UI on open)
                       <span className="block text-[11.5px] text-[#6B7280] dark:text-[#9CA3AF]">
-                        Flushes active AI chat and selected project to session.json before destroying WebView2 so state restores cleanly on re-open.
+                        Optional: flushes active AI chat and selected project to session.json and destroys WebView2 when hidden to tray; restores exact session state on reopen.
                       </span>
                     </span>
                   </label>

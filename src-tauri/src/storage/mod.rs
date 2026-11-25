@@ -214,4 +214,16 @@ impl AtomicJsonStore {
             Ok(String::from_utf8_lossy(slice).to_string())
         }
     }
+
+    /// Waits briefly for any in-flight atomic JSON write lock to finish before
+    /// exiting from the system tray without risking a Tokio runtime panic.
+    pub fn flush_checkpoint_sync(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            if let Ok(_guard) = self.write_lock.try_lock() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
 }

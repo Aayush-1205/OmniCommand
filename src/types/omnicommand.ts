@@ -218,6 +218,46 @@ export interface ChatMentionItem {
   parentProjectName?: string;
 }
 
+export interface ExportedProjectTemplateCommand {
+  name: string;
+  alias: string;
+  command: string;
+  engine: EngineType;
+  riskLevel: RiskLevel;
+  runPolicy: RunPolicy;
+  aiAllowed: boolean;
+  description: string;
+}
+
+export interface ExportedProjectTemplate {
+  id: string;
+  schemaVersion: "1.0";
+  projectName: string;
+  defaultEngine: EngineType;
+  exportedAt: string;
+  commands: ExportedProjectTemplateCommand[];
+}
+
+export interface WorkspaceFileEntry {
+  name: string;
+  kind: "file" | "dir";
+  readableManifest: boolean;
+  blockedSecret?: boolean;
+}
+
+export interface WorkspaceManifestFile {
+  filename: string;
+  content: string;
+  truncated: boolean;
+}
+
+export interface WorkspaceInspectionResult {
+  basePath: string;
+  entries: WorkspaceFileEntry[];
+  manifest?: WorkspaceManifestFile | null;
+  simulated?: boolean;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -227,6 +267,8 @@ export interface ChatMessage {
   optionCards?: ResolvedOptionCard[];
   completionChips?: CompletionChip[];
   suggestions?: SuggestedCommandItem[];
+  suggestionsLoading?: boolean;
+  exportedTemplates?: ExportedProjectTemplate[];
   mentions?: ChatMentionItem[];
 }
 
@@ -248,6 +290,22 @@ export interface BatchApprovalCommandPreview {
   description?: string;
 }
 
+export interface ScaffoldProjectPreview {
+  name: string;
+  basePath: string;
+  defaultEngine: EngineType;
+}
+
+export interface SequenceStepPreview {
+  stepIndex: number;
+  label: string;
+  commandText: string;
+  engine: EngineType;
+  basePath: string;
+  riskLevel: RiskLevel;
+  commandId?: string | null;
+}
+
 export interface PendingApproval {
   id: string;
   toolName: string;
@@ -258,8 +316,13 @@ export interface PendingApproval {
   riskLevel: RiskLevel;
   reason: string;
   details: Record<string, unknown>;
-  /** Populated for `create_commands_batch` so one Batch Approval Card lets users select individual commands. */
+  /** Populated for `create_commands_batch` and `scaffold_project_with_commands`. */
   batchCommands?: BatchApprovalCommandPreview[];
+  /** Populated for `scaffold_project_with_commands` to display project header + commands in one card. */
+  scaffoldProject?: ScaffoldProjectPreview;
+  /** Populated for `run_command_sequence` to show pre-resolved sequential steps in one card. */
+  sequenceSteps?: SequenceStepPreview[];
+  stopOnError?: boolean;
   resolve: (approved: boolean | string[]) => void;
 }
 

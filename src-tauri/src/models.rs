@@ -270,3 +270,29 @@ pub struct ExecutionFinishedEvent {
     pub exit_code: Option<i32>,
     pub duration_ms: u64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceFileEntry {
+    pub name: String,
+    pub kind: String,
+    pub readable_manifest: bool,
+    pub blocked_secret: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceManifestFile {
+    pub filename: String,
+    pub content: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceInspectionResult {
+    pub base_path: String,
+    pub entries: Vec<WorkspaceFileEntry>,
+    pub manifest: Option<WorkspaceManifestFile>,
+    pub simulated: bool,
+}

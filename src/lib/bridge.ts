@@ -10,6 +10,8 @@ import type {
   PathValidationResult,
   Project,
   SessionState,
+  WorkspaceFileEntry,
+  WorkspaceInspectionResult,
 } from "../types/omnicommand";
 import { checkCommandGuardrails, validateLocalPathClient } from "./guardrails";
 
@@ -461,6 +463,72 @@ export const runtimeBridge = {
       return tauriInvoke<string>("get_storage_root");
     }
     return "%LocalAppData%\\OmniCommand";
+  },
+
+  async revealMainWindow(): Promise<boolean> {
+    if (!isTauriRuntime()) {
+      return false;
+    }
+    try {
+      return await tauriInvoke<boolean>("reveal_main_window");
+    } catch {
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        const win = getCurrentWindow();
+        await win.unminimize().catch(() => {});
+        await win.show();
+        await win.setFocus().catch(() => {});
+      } catch {
+        // ignore if already visible
+      }
+      return false;
+    }
+  },
+
+  async inspectWorkspaceFiles(params: {
+    basePath: string;
+    manifestFile?: string;
+    projectName?: string;
+    defaultEngine?: EngineType;
+  }): Promise<WorkspaceInspectionResult> {
+    const check = await this.validatePath(params.basePath, true);
+    if (!check.valid) {
+      throw new Error(check.blockedReason ?? "Invalid or blocked project basePath.");
+    }
+    const canonicalBase = check.canonicalPath ?? params.basePath.trim();
+
+    const requested = params.manifestFile?.trim();
+    if (requested) {
+      if (requested.includes("..") || requested.includes("/") || requested.includes("\\")) {
+        throw new Error(
+          "Path escapes project basePath: manifestFile must be a top-level filename without path traversal."
+        );
+      }
+      if (isBlockedSecretFilename(requested)) {
+        throw new Error(
+          `Access denied: "${requested}" is blocked by secret-file guardrails (.env*, *.pem, *.key, id_rsa, credentials*, settings.json).`
+        );
+      }
+      if (!isAllowedManifestFilename(requested)) {
+        throw new Error(
+          `Unsupported manifest "${requested}". Allowed manifests: package.json, Cargo.toml, pyproject.toml, requirements.txt, Makefile, docker-compose.yml, README.md.`
+        );
+      }
+    }
+
+    if (isTauriRuntime()) {
+      return tauriInvoke<WorkspaceInspectionResult>("inspect_workspace_files", {
+        basePath: canonicalBase,
+        manifestFile: requested ?? null,
+      });
+    }
+
+    return simulatePreviewWorkspaceInspection({
+      basePath: canonicalBase,
+      manifestFile: requested,
+      projectName: params.projectName,
+      defaultEngine: params.defaultEngine,
+    });
   },
 
   async pickFolderNative(options?: {
@@ -967,5 +1035,168 @@ function buildPreviewExecutionPlan(
         ],
       },
     ],
+  };
+}
+
+const ALLOWED_MANIFEST_SET = new Set([
+  "package.json",
+  "cargo.toml",
+  "pyproject.toml",
+  "requirements.txt",
+  "makefile",
+  "docker-compose.yml",
+  "docker-compose.yaml",
+  "readme.md",
+]);
+
+function isBlockedSecretFilename(name: string): boolean {
+  const lower = name.trim().toLowerCase();
+  return (
+    lower.startsWith(".env") ||
+    lower.endsWith(".pem") ||
+    lower.endsWith(".key") ||
+    lower === "id_rsa" ||
+    lower === "id_ed25519" ||
+    lower.startsWith("credentials") ||
+    lower === "settings.json"
+  );
+}
+
+function isAllowedManifestFilename(name: string): boolean {
+  return ALLOWED_MANIFEST_SET.has(name.trim().toLowerCase());
+}
+
+/**
+ * Browser preview stack-manifest simulator inferred from project name, path, and engine.
+ * In the native Windows Tauri app, `inspect_workspace_files` reads real local files via Rust.
+ */
+function simulatePreviewWorkspaceInspection(params: {
+  basePath: string;
+  manifestFile?: string;
+  projectName?: string;
+  defaultEngine?: EngineType;
+}): WorkspaceInspectionResult {
+  const slugSource = (params.projectName || params.basePath.split(/[\\/]/).filter(Boolean).pop() || "workspace")
+    .toLowerCase();
+  const slug = slugSource.replace(/[^a-z0-9-_]+/g, "-") || "workspace";
+  const hint = `${slugSource} ${params.basePath.toLowerCase()}`;
+
+  const isPython =
+    params.defaultEngine === "python" ||
+    /\b(py|python|fastapi|django|flask|ml|ai|data)\b/.test(hint);
+  const isRust = /\b(rust|cargo|tauri|cli|rs)\b/.test(hint);
+  const isDocker = /\b(docker|infra|ops|compose|k8s|deploy)\b/.test(hint);
+
+  const files: Record<string, string> = {};
+  const entries: WorkspaceFileEntry[] = [
+    { name: "src", kind: "dir", readableManifest: false },
+  ];
+
+  if (isPython) {
+    entries.push(
+      { name: "tests", kind: "dir", readableManifest: false },
+      { name: "pyproject.toml", kind: "file", readableManifest: true },
+      { name: "requirements.txt", kind: "file", readableManifest: true },
+      { name: "README.md", kind: "file", readableManifest: true },
+      { name: ".env", kind: "file", readableManifest: false, blockedSecret: true }
+    );
+    files["pyproject.toml"] = [
+      `[project]`,
+      `name = "${slug}"`,
+      `version = "0.1.0"`,
+      `requires-python = ">=3.11"`,
+      `dependencies = ["fastapi", "uvicorn", "pydantic"]`,
+      ``,
+      `[tool.pytest.ini_options]`,
+      `testpaths = ["tests"]`,
+      ``,
+      `[tool.ruff]`,
+      `line-length = 100`,
+    ].join("\n");
+    files["requirements.txt"] = "fastapi>=0.115.0\nuvicorn[standard]>=0.32.0\npytest>=8.3.0\nruff>=0.8.0\n";
+    files["readme.md"] = `# ${params.projectName || slug}\n\nPython service workspace.\n\n- Run dev server: \`uvicorn src.main:app --reload\`\n- Run tests: \`pytest -q\`\n- Lint: \`ruff check .\`\n`;
+  } else if (isRust) {
+    entries.push(
+      { name: "Cargo.toml", kind: "file", readableManifest: true },
+      { name: "Makefile", kind: "file", readableManifest: true },
+      { name: "README.md", kind: "file", readableManifest: true }
+    );
+    files["cargo.toml"] = [
+      `[package]`,
+      `name = "${slug}"`,
+      `version = "0.1.0"`,
+      `edition = "2021"`,
+      ``,
+      `[dependencies]`,
+      `serde = { version = "1", features = ["derive"] }`,
+      `tokio = { version = "1", features = ["full"] }`,
+    ].join("\n");
+    files["makefile"] = "build:\n\tcargo build --release\n\ntest:\n\tcargo test\n\nlint:\n\tcargo clippy -- -D warnings\n";
+    files["readme.md"] = `# ${params.projectName || slug}\n\nRust workspace.\n\n- Build: \`cargo build\`\n- Test: \`cargo test\`\n- Lint: \`cargo clippy\`\n`;
+  } else {
+    entries.push(
+      { name: "public", kind: "dir", readableManifest: false },
+      { name: "package.json", kind: "file", readableManifest: true },
+      { name: "README.md", kind: "file", readableManifest: true },
+      { name: ".env.local", kind: "file", readableManifest: false, blockedSecret: true }
+    );
+    if (isDocker) {
+      entries.push({ name: "docker-compose.yml", kind: "file", readableManifest: true });
+      files["docker-compose.yml"] = `services:\n  app:\n    build: .\n    ports:\n      - "3000:3000"\n  redis:\n    image: redis:7-alpine\n`;
+    }
+    files["package.json"] = JSON.stringify(
+      {
+        name: slug,
+        version: "1.0.0",
+        private: true,
+        scripts: {
+          dev: "vite --port 3000",
+          build: "tsc && vite build",
+          lint: "eslint . --max-warnings=0",
+          test: "vitest run",
+          typecheck: "tsc --noEmit",
+        },
+        dependencies: {
+          react: "^19.0.0",
+          "react-dom": "^19.0.0",
+        },
+        devDependencies: {
+          typescript: "^5.7.0",
+          vite: "^6.0.0",
+          vitest: "^3.0.0",
+        },
+      },
+      null,
+      2
+    );
+    files["readme.md"] = `# ${params.projectName || slug}\n\nTypeScript/Vite project.\n\n- Dev: \`npm run dev\`\n- Build: \`npm run build\`\n- Test: \`npm test\`\n- Typecheck: \`npm run typecheck\`\n`;
+  }
+
+  let manifest: WorkspaceInspectionResult["manifest"] = null;
+  if (params.manifestFile) {
+    const key = params.manifestFile.trim().toLowerCase();
+    const raw = files[key];
+    if (!raw) {
+      throw new Error(
+        `Manifest "${params.manifestFile}" was not found in ${params.basePath}. Available readable manifests: ${entries
+          .filter((e) => e.readableManifest)
+          .map((e) => e.name)
+          .join(", ") || "none"}.`
+      );
+    }
+    const stripped = raw.replace(/^\uFEFF/, "");
+    const truncated = stripped.length > 8192;
+    manifest = {
+      filename: params.manifestFile.trim(),
+      content: truncated ? stripped.slice(0, 8192) : stripped,
+      truncated,
+    };
+  }
+
+  return {
+    basePath: params.basePath,
+    entries,
+    manifest,
+    simulated: true,
   };
 }

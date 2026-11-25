@@ -16,16 +16,22 @@ export interface PolicyDecision {
 const ALWAYS_AUTO_TOOLS = new Set([
   "list_projects",
   "validate_local_path",
+  "inspect_workspace_files",
   "list_commands",
   "stop_execution",
   "get_execution_logs",
+  "search_execution_history",
   "analyze_execution_error",
+  "export_project_template",
   "list_available_engines",
   "ask_user_options",
-  "suggest_next_commands",
 ]);
 
-const ALWAYS_ASK_TOOLS = new Set(["delete_project", "delete_command"]);
+const ALWAYS_ASK_TOOLS = new Set([
+  "delete_project",
+  "delete_command",
+  "scaffold_project_with_commands",
+]);
 
 const MUTATING_CRUD_TOOLS = new Set([
   "create_project",
@@ -62,11 +68,14 @@ export function evaluateToolPolicy(params: {
     return { decision: "allow", reason: "Read-only or diagnostic tool." };
   }
 
-  // 2. Destructive CRUD tools always require explicit approval
+  // 2. Tools requiring explicit user confirmation via Approval Card
   if (ALWAYS_ASK_TOOLS.has(toolName)) {
     return {
       decision: "ask",
-      reason: "Destructive deletion always requires explicit user confirmation.",
+      reason:
+        toolName === "scaffold_project_with_commands"
+          ? "Review project settings and starter commands before creating."
+          : "Destructive deletion always requires explicit user confirmation.",
     };
   }
 

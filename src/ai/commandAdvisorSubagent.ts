@@ -138,88 +138,105 @@ export async function runCommandAdvisorSubagent(params: {
   existingCommands: string[];
   userGoal: string;
   provider: ProviderConfig;
+  signal?: AbortSignal;
 }): Promise<SuggestedCommandItem[]> {
-  const { projectId, projectName, basePath, engine, existingCommands, userGoal, provider } =
-    params;
+  const {
+    projectId,
+    projectName,
+    basePath,
+    engine,
+    existingCommands,
+    userGoal,
+    provider,
+    signal,
+  } = params;
 
-  if (provider.secretStatus === "decrypt_failed") {
+  if (provider.secretStatus === "decrypt_failed" || signal?.aborted) {
     return [];
   }
 
-  const apiKey = await runtimeBridge.getProviderDecryptedKey(provider.id);
-  const allowKeyless = provider.providerType === "custom" && isLocalLoopbackUrl(provider.baseUrl);
-  if (!apiKey && !allowKeyless) {
-    return [];
-  }
+  try {
+    const apiKey = await runtimeBridge.getProviderDecryptedKey(provider.id);
+    const allowKeyless = provider.providerType === "custom" && isLocalLoopbackUrl(provider.baseUrl);
+    if (!apiKey && !allowKeyless) {
+      return [];
+    }
 
-  const userPrompt = [
-    `Project Name: ${projectName}`,
-    `Base Path: ${basePath || "(Global Root — prompts for directory at runtime)"}`,
-    `Default Engine: ${engine}`,
-    `User Recent Goal: ${userGoal}`,
-    `Existing Commands (DO NOT duplicate these):`,
-    existingCommands.length > 0
-      ? existingCommands.map((c) => `- ${c}`).join("\n")
-      : "- (none)",
-    "",
-    `Return ONLY valid JSON matching this exact shape (no prose outside JSON):`,
-    `{`,
-    `  "suggestions": [`,
-    `    {`,
-    `      "name": "Short Command Name",`,
-    `      "alias": "short-alias",`,
-    `      "command": "exact shell command using {var} placeholders where helpful",`,
-    `      "engine": "${engine}",`,
-    `      "riskLevel": "low",`,
-    `      "explanation": "One concise sentence explaining why this command helps."`,
-    `    }`,
-    `  ]`,
-    `}`,
-  ].join("\n");
+    const userPrompt = [
+      `Project Name: ${projectName}`,
+      `Base Path: ${basePath || "(Global Root — prompts for directory at runtime)"}`,
+      `Default Engine: ${engine}`,
+      `User Recent Goal: ${userGoal}`,
+      `Existing Commands (DO NOT duplicate these):`,
+      existingCommands.length > 0
+        ? existingCommands.map((c) => `- ${c}`).join("\n")
+        : "- (none)",
+      "",
+      `Return ONLY valid JSON matching this exact shape (no prose outside JSON):`,
+      `{`,
+      `  "suggestions": [`,
+      `    {`,
+      `      "name": "Short Command Name",`,
+      `      "alias": "short-alias",`,
+      `      "command": "exact shell command using {var} placeholders where helpful",`,
+      `      "engine": "${engine}",`,
+      `      "riskLevel": "low",`,
+      `      "explanation": "One concise sentence explaining why this command helps."`,
+      `    }`,
+      `  ]`,
+      `}`,
+    ].join("\n");
 
-  if (isTauriRuntime()) {
-    const model = await createOmniLanguageModel(provider, apiKey ?? "");
-    const { text } = await generateText({
-      model,
-      system: COMMAND_ADVISOR_SYSTEM_PROMPT,
-      prompt: userPrompt,
+    if (isTauriRuntime()) {
+      const model = await createOmniLanguageModel(provider, apiKey ?? "");
+      const { text } = await generateText({
+        model,
+        system: COMMAND_ADVISOR_SYSTEM_PROMPT,
+        prompt: userPrompt,
+        abortSignal: signal,
+      });
+      return normalizeSuggestions(text ?? "", {
+        defaultEngine: engine,
+        projectId,
+        projectName,
+        existingCommands,
+      });
+    }
+
+    const response = await fetch("/api/preview-ai/suggest", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal,
+      body: JSON.stringify({
+        systemPrompt: COMMAND_ADVISOR_SYSTEM_PROMPT,
+        prompt: userPrompt,
+        provider: {
+          providerType: provider.providerType,
+          modelId: provider.modelId,
+          baseUrl: provider.baseUrl ?? null,
+          customHeaders: provider.customHeaders ?? null,
+          apiKey: apiKey ?? "",
+        },
+      }),
     });
-    return normalizeSuggestions(text ?? "", {
+
+    if (!response.ok) {
+      // Silently ignore 429 rate-limit bursts or transient upstream failures
+      return [];
+    }
+    const data = (await response.json()) as { rawText?: string; error?: string };
+    if (data.error || !data.rawText) {
+      return [];
+    }
+
+    return normalizeSuggestions(data.rawText, {
       defaultEngine: engine,
       projectId,
       projectName,
       existingCommands,
     });
-  }
-
-  const response = await fetch("/api/preview-ai/suggest", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      systemPrompt: COMMAND_ADVISOR_SYSTEM_PROMPT,
-      prompt: userPrompt,
-      provider: {
-        providerType: provider.providerType,
-        modelId: provider.modelId,
-        baseUrl: provider.baseUrl ?? null,
-        customHeaders: provider.customHeaders ?? null,
-        apiKey: apiKey ?? "",
-      },
-    }),
-  });
-
-  if (!response.ok) {
+  } catch {
+    // Silent fallback for rate limits (429), aborts, or transient failures
     return [];
   }
-  const data = (await response.json()) as { rawText?: string; error?: string };
-  if (data.error || !data.rawText) {
-    return [];
-  }
-
-  return normalizeSuggestions(data.rawText, {
-    defaultEngine: engine,
-    projectId,
-    projectName,
-    existingCommands,
-  });
 }

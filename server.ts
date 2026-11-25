@@ -12,7 +12,7 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createXai } from "@ai-sdk/xai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { generateText, tool, type ModelMessage } from "ai";
+import { generateText, streamText, tool, type ModelMessage } from "ai";
 import {
   TOOL_DESCRIPTIONS,
   TOOL_SCHEMAS,
@@ -29,6 +29,10 @@ const PREVIEW_AI_SDK_TOOLS = {
     description: TOOL_DESCRIPTIONS.create_project,
     inputSchema: TOOL_SCHEMAS.create_project,
   }),
+  scaffold_project_with_commands: tool({
+    description: TOOL_DESCRIPTIONS.scaffold_project_with_commands,
+    inputSchema: TOOL_SCHEMAS.scaffold_project_with_commands,
+  }),
   update_project: tool({
     description: TOOL_DESCRIPTIONS.update_project,
     inputSchema: TOOL_SCHEMAS.update_project,
@@ -40,6 +44,10 @@ const PREVIEW_AI_SDK_TOOLS = {
   validate_local_path: tool({
     description: TOOL_DESCRIPTIONS.validate_local_path,
     inputSchema: TOOL_SCHEMAS.validate_local_path,
+  }),
+  inspect_workspace_files: tool({
+    description: TOOL_DESCRIPTIONS.inspect_workspace_files,
+    inputSchema: TOOL_SCHEMAS.inspect_workspace_files,
   }),
   list_commands: tool({
     description: TOOL_DESCRIPTIONS.list_commands,
@@ -73,6 +81,10 @@ const PREVIEW_AI_SDK_TOOLS = {
     description: TOOL_DESCRIPTIONS.run_adhoc_command,
     inputSchema: TOOL_SCHEMAS.run_adhoc_command,
   }),
+  run_command_sequence: tool({
+    description: TOOL_DESCRIPTIONS.run_command_sequence,
+    inputSchema: TOOL_SCHEMAS.run_command_sequence,
+  }),
   stop_execution: tool({
     description: TOOL_DESCRIPTIONS.stop_execution,
     inputSchema: TOOL_SCHEMAS.stop_execution,
@@ -81,17 +93,21 @@ const PREVIEW_AI_SDK_TOOLS = {
     description: TOOL_DESCRIPTIONS.get_execution_logs,
     inputSchema: TOOL_SCHEMAS.get_execution_logs,
   }),
+  search_execution_history: tool({
+    description: TOOL_DESCRIPTIONS.search_execution_history,
+    inputSchema: TOOL_SCHEMAS.search_execution_history,
+  }),
   analyze_execution_error: tool({
     description: TOOL_DESCRIPTIONS.analyze_execution_error,
     inputSchema: TOOL_SCHEMAS.analyze_execution_error,
   }),
+  export_project_template: tool({
+    description: TOOL_DESCRIPTIONS.export_project_template,
+    inputSchema: TOOL_SCHEMAS.export_project_template,
+  }),
   ask_user_options: tool({
     description: TOOL_DESCRIPTIONS.ask_user_options,
     inputSchema: TOOL_SCHEMAS.ask_user_options,
-  }),
-  suggest_next_commands: tool({
-    description: TOOL_DESCRIPTIONS.suggest_next_commands,
-    inputSchema: TOOL_SCHEMAS.suggest_next_commands,
   }),
 };
 
@@ -405,22 +421,95 @@ const OMNICOMMAND_FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
     },
   },
   {
-    name: "suggest_next_commands",
-    description: TOOL_DESCRIPTIONS.suggest_next_commands,
+    name: "scaffold_project_with_commands",
+    description: TOOL_DESCRIPTIONS.scaffold_project_with_commands,
     parameters: {
       type: Type.OBJECT,
       properties: {
-        projectId: { type: Type.STRING, description: "Optional project ID (or null for Global Root)" },
-        projectName: { type: Type.STRING },
+        name: { type: Type.STRING },
         basePath: { type: Type.STRING },
-        engine: { type: Type.STRING },
-        existingCommands: {
+        defaultEngine: { type: Type.STRING },
+        commands: {
           type: Type.ARRAY,
-          items: { type: Type.STRING },
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              name: { type: Type.STRING },
+              alias: { type: Type.STRING },
+              command: { type: Type.STRING },
+              engine: { type: Type.STRING },
+              riskLevel: { type: Type.STRING },
+              runPolicy: { type: Type.STRING },
+              aiAllowed: { type: Type.BOOLEAN },
+              description: { type: Type.STRING },
+            },
+            required: ["name", "command"],
+          },
         },
-        userGoal: { type: Type.STRING },
       },
-      required: ["projectName", "userGoal"],
+      required: ["name", "basePath", "commands"],
+    },
+  },
+  {
+    name: "inspect_workspace_files",
+    description: TOOL_DESCRIPTIONS.inspect_workspace_files,
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        projectId: { type: Type.STRING },
+        basePath: { type: Type.STRING },
+        manifestFile: { type: Type.STRING },
+      },
+    },
+  },
+  {
+    name: "run_command_sequence",
+    description: TOOL_DESCRIPTIONS.run_command_sequence,
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        steps: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              commandId: { type: Type.STRING },
+              commandText: { type: Type.STRING },
+              engine: { type: Type.STRING },
+              label: { type: Type.STRING },
+              riskLevel: { type: Type.STRING },
+            },
+          },
+        },
+        basePath: { type: Type.STRING },
+        stopOnError: { type: Type.BOOLEAN },
+      },
+      required: ["steps"],
+    },
+  },
+  {
+    name: "search_execution_history",
+    description: TOOL_DESCRIPTIONS.search_execution_history,
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        projectId: { type: Type.STRING },
+        status: { type: Type.STRING },
+        engine: { type: Type.STRING },
+        query: { type: Type.STRING },
+        limit: { type: Type.NUMBER },
+      },
+    },
+  },
+  {
+    name: "export_project_template",
+    description: TOOL_DESCRIPTIONS.export_project_template,
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        projectId: { type: Type.STRING },
+      },
+      required: ["projectId"],
     },
   },
 ];
@@ -642,25 +731,54 @@ async function startServer() {
   });
 
   app.post("/api/preview-ai/chat", async (req, res) => {
-    try {
-      const { contents, systemInstruction, provider } = req.body as {
-        contents: Array<{ role: string; parts: unknown[] }>;
-        systemInstruction?: string;
-        provider?: ProviderPayload;
-      };
+    const abortController = new AbortController();
+    let clientClosed = false;
+    req.on("close", () => {
+      clientClosed = true;
+      abortController.abort();
+    });
 
-      if (!Array.isArray(contents) || contents.length === 0) {
-        return res.status(400).json({ error: "Missing conversation contents." });
-      }
-      if (!provider) {
-        return res.status(400).json({ error: "No AI provider configured. Connect an AI provider first." });
-      }
+    const { contents, systemInstruction, provider, stream = true } = req.body as {
+      contents: Array<{ role: string; parts: unknown[] }>;
+      systemInstruction?: string;
+      provider?: ProviderPayload;
+      stream?: boolean;
+    };
+
+    if (!Array.isArray(contents) || contents.length === 0) {
+      return res.status(400).json({ error: "Missing conversation contents." });
+    }
+    if (!provider) {
+      return res.status(400).json({ error: "No AI provider configured. Connect an AI provider first." });
+    }
+
+    const sendSse = (payload: Record<string, unknown>) => {
+      if (clientClosed || res.writableEnded) return;
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    };
+
+    if (stream) {
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.flushHeaders?.();
+    }
+
+    try {
+      const effectiveSystem =
+        systemInstruction ||
+        "You are OmniCommand's minimalist Windows developer operations assistant. Always invoke real tools instead of fabricating actions in text.";
 
       if (provider.providerType === "gemini") {
         const apiKey = provider.apiKey?.trim();
         if (!apiKey) {
+          if (stream) {
+            sendSse({ type: "error", error: "Google Gemini API key is not configured." });
+            return res.end();
+          }
           return res.status(401).json({ error: "Google Gemini API key is not configured." });
         }
+
         const ai = new GoogleGenAI({
           apiKey,
           httpOptions: {
@@ -671,22 +789,55 @@ async function startServer() {
           },
         });
 
-        const response = await ai.models.generateContent({
+        const streamResp = await ai.models.generateContentStream({
           model: provider.modelId || "gemini-2.5-flash",
           contents: contents as never,
           config: {
-            systemInstruction:
-              systemInstruction ||
-              "You are OmniCommand's minimalist Windows developer operations assistant. Always invoke real tools instead of fabricating actions in text.",
+            systemInstruction: effectiveSystem,
             tools: [{ functionDeclarations: OMNICOMMAND_FUNCTION_DECLARATIONS }],
+            abortSignal: abortController.signal,
           },
         });
 
-        const calls = (response.functionCalls ?? []).map((fc, idx) => ({
-          id: fc.id || `gemini_call_${Date.now()}_${idx}`,
-          name: fc.name ?? "",
-          args: (fc.args as Record<string, unknown>) ?? {},
-        }));
+        let accumulatedText = "";
+        const calls: Array<{ id: string; name: string; args: Record<string, unknown> }> = [];
+        const modelParts: unknown[] = [];
+
+        for await (const chunk of streamResp) {
+          if (abortController.signal.aborted || clientClosed) break;
+
+          const chunkText = chunk.text ?? "";
+          if (chunkText) {
+            accumulatedText += chunkText;
+            if (stream) {
+              sendSse({ type: "text-delta", delta: chunkText });
+            }
+          }
+
+          const chunkCalls = chunk.functionCalls ?? [];
+          for (const fc of chunkCalls) {
+            const callObj = {
+              id: fc.id || `gemini_call_${Date.now()}_${calls.length}`,
+              name: fc.name ?? "",
+              args: (fc.args as Record<string, unknown>) ?? {},
+            };
+            calls.push(callObj);
+          }
+
+          const candidateParts = chunk.candidates?.[0]?.content?.parts;
+          if (Array.isArray(candidateParts)) {
+            for (const part of candidateParts) {
+              if ((part as { functionCall?: unknown }).functionCall) {
+                modelParts.push(part);
+              }
+            }
+          }
+        }
+
+        if (abortController.signal.aborted || clientClosed) {
+          if (stream && !res.writableEnded) res.end();
+          return;
+        }
 
         if (calls.length > 0) {
           console.log(
@@ -694,17 +845,34 @@ async function startServer() {
           );
         }
 
-        const modelContent = response.candidates?.[0]?.content ?? null;
-        return res.json({
+        const finalParts: unknown[] = [];
+        if (accumulatedText.trim()) finalParts.push({ text: accumulatedText });
+        if (modelParts.length > 0) {
+          finalParts.push(...modelParts);
+        } else {
+          for (const fc of calls) {
+            finalParts.push({
+              functionCall: { id: fc.id, name: fc.name, args: fc.args },
+            });
+          }
+        }
+
+        const resultPayload = {
           model: provider.modelId,
-          text: response.text ?? "",
+          text: accumulatedText,
           functionCalls: calls,
-          modelContent,
-        });
+          modelContent: finalParts.length > 0 ? { role: "model", parts: finalParts } : null,
+        };
+
+        if (stream) {
+          sendSse({ type: "result", ...resultPayload });
+          return res.end();
+        }
+        return res.json(resultPayload);
       }
 
       // Non-Gemini providers (Claude, OpenAI, Grok, OpenRouter, Perplexity, Z.ai, Custom)
-      // via Vercel AI SDK with the FULL 16-tool Zod dictionary + proper multi-turn tool messages
+      // via Vercel AI SDK `streamText` with full Zod tool dictionary + abortSignal cleanup
       const model = createNonGeminiPreviewModel(provider);
 
       type RawPart = {
@@ -773,17 +941,35 @@ async function startServer() {
         messages.push({ role: "user", content: userText || " " });
       }
 
-      const result = await generateText({
+      const streamResult = streamText({
         model,
-        system:
-          systemInstruction ||
-          "You are OmniCommand's minimalist Windows developer operations assistant. Always invoke real tools instead of fabricating actions in text.",
+        system: effectiveSystem,
         messages,
         tools: PREVIEW_AI_SDK_TOOLS,
         toolChoice: "auto",
+        abortSignal: abortController.signal,
       });
 
-      const functionCalls = (result.toolCalls ?? []).map((tc, idx) => ({
+      let accumulatedText = "";
+      for await (const delta of streamResult.textStream) {
+        if (abortController.signal.aborted || clientClosed) break;
+        if (delta) {
+          accumulatedText += delta;
+          if (stream) {
+            sendSse({ type: "text-delta", delta });
+          }
+        }
+      }
+
+      if (abortController.signal.aborted || clientClosed) {
+        if (stream && !res.writableEnded) res.end();
+        return;
+      }
+
+      const rawToolCalls = await streamResult.toolCalls;
+      const finalText = (await streamResult.text) || accumulatedText;
+
+      const functionCalls = (rawToolCalls ?? []).map((tc, idx) => ({
         id: tc.toolCallId || `ai_call_${Date.now()}_${idx}`,
         name: tc.toolName,
         args: (tc.input as Record<string, unknown>) ?? {},
@@ -796,8 +982,8 @@ async function startServer() {
       }
 
       const assistantContentParts: unknown[] = [];
-      if (result.text && result.text.trim()) {
-        assistantContentParts.push({ text: result.text });
+      if (finalText && finalText.trim()) {
+        assistantContentParts.push({ text: finalText });
       }
       for (const fc of functionCalls) {
         assistantContentParts.push({
@@ -809,18 +995,32 @@ async function startServer() {
         });
       }
 
-      return res.json({
+      const resultPayload = {
         model: provider.modelId,
-        text: result.text ?? "",
+        text: finalText ?? "",
         functionCalls,
         modelContent:
           assistantContentParts.length > 0
             ? { role: "model", parts: assistantContentParts }
             : null,
-      });
+      };
+
+      if (stream) {
+        sendSse({ type: "result", ...resultPayload });
+        return res.end();
+      }
+      return res.json(resultPayload);
     } catch (error) {
+      if (abortController.signal.aborted || clientClosed) {
+        if (stream && !res.writableEnded) res.end();
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       console.error("[preview-ai/chat] error:", message);
+      if (stream) {
+        sendSse({ type: "error", error: message });
+        return res.end();
+      }
       return res.status(500).json({ error: message });
     }
   });

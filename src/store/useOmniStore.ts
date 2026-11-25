@@ -12,6 +12,7 @@ import type {
   EngineType,
   ExecutionFinishedEvent,
   ExecutionRecord,
+  ExportedProjectTemplate,
   OptionPromptResponse,
   OutputBatchEvent,
   PendingApproval,
@@ -37,6 +38,7 @@ import {
 } from "../lib/variables";
 import { runAgentTurn } from "../ai/agentRunner";
 import { analyzeExecutionError } from "../ai/errorAnalyzer";
+import { runCommandAdvisorSubagent } from "../ai/commandAdvisorSubagent";
 import {
   testProviderConnection,
   type ConnectionTestResult,
@@ -92,11 +94,14 @@ interface OmniStore {
   variablePromptModal: VariablePromptRequest | null;
 
   // AI loading & streaming state
+  chatSessionId: number;
+  activeAgentAbortController: AbortController | null;
   aiBusy: boolean;
   aiLiveTraces: ToolTraceItem[];
   aiStreamingText: string;
   aiLiveOptionCards: ResolvedOptionCard[];
   aiLiveSuggestions: SuggestedCommandItem[];
+  aiLiveExportedTemplates: ExportedProjectTemplate[];
 
   // Notices
   toasts: ToastNotice[];
@@ -226,6 +231,7 @@ interface OmniStore {
 
   // AI Assistant
   sendChatMessage: (text: string, mentions?: ChatMentionItem[]) => Promise<void>;
+  stopAgentTurn: () => void;
   explainExecutionError: (executionId: string) => Promise<void>;
   clearChatHistory: () => void;
 }
@@ -292,11 +298,14 @@ export const useOmniStore = create<OmniStore>((set, get) => ({
   confirmRunModal: null,
   variablePromptModal: null,
 
+  chatSessionId: 1,
+  activeAgentAbortController: null,
   aiBusy: false,
   aiLiveTraces: [],
   aiStreamingText: "",
   aiLiveOptionCards: [],
   aiLiveSuggestions: [],
+  aiLiveExportedTemplates: [],
   toasts: [],
 
   initialize: async () => {
@@ -1125,18 +1134,159 @@ export const useOmniStore = create<OmniStore>((set, get) => ({
       mentions: resolvedMentions.length > 0 ? resolvedMentions : undefined,
     };
 
+    const abortController = new AbortController();
+    const sessionId = get().chatSessionId;
+
     const historyBefore = get().chatMessages;
     set({
       chatMessages: [...historyBefore, userMsg],
+      activeAgentAbortController: abortController,
       aiBusy: true,
       aiLiveTraces: [],
       aiStreamingText: "",
       aiLiveOptionCards: [],
       aiLiveSuggestions: [],
+      aiLiveExportedTemplates: [],
       pendingOptionPrompt: null,
       aiDrawerOpen: true,
     });
     scheduleSessionPersist(get);
+
+    const waitForExecution = (executionId: string): Promise<ExecutionRecord> => {
+      const existing = get().executions.find((e) => e.id === executionId);
+      if (existing && existing.status !== "running") {
+        return Promise.resolve(existing);
+      }
+
+      return new Promise<ExecutionRecord>((resolve) => {
+        let settled = false;
+        let unsubscribe: (() => void) | null = null;
+        let safetyTimer: number | null = null;
+
+        const finish = (rec: ExecutionRecord) => {
+          if (settled) return;
+          settled = true;
+          if (unsubscribe) unsubscribe();
+          if (safetyTimer !== null) window.clearTimeout(safetyTimer);
+          abortController.signal.removeEventListener("abort", onAbort);
+          resolve(rec);
+        };
+
+        const onAbort = () => {
+          void runtimeBridge.stopExecution(executionId);
+          const current = get().executions.find((e) => e.id === executionId);
+          finish(
+            current
+              ? { ...current, status: "killed", exitCode: -1 }
+              : {
+                  id: executionId,
+                  commandId: null,
+                  projectId: null,
+                  engine: "powershell",
+                  commandText: "",
+                  basePath: "",
+                  status: "killed",
+                  exitCode: -1,
+                  durationMs: 0,
+                  triggeredBy: "ai",
+                  logFilePath: "",
+                  startedAt: new Date().toISOString(),
+                }
+          );
+        };
+
+        abortController.signal.addEventListener("abort", onAbort, { once: true });
+
+        unsubscribe = useOmniStore.subscribe((state) => {
+          const match = state.executions.find((e) => e.id === executionId);
+          if (match && match.status !== "running") {
+            finish(match);
+          }
+        });
+
+        const timeoutMs = (Math.max(10, get().settings.commandTimeoutSec) + 5) * 1000;
+        safetyTimer = window.setTimeout(() => {
+          const match = get().executions.find((e) => e.id === executionId);
+          finish(
+            match ?? {
+              id: executionId,
+              commandId: null,
+              projectId: null,
+              engine: "powershell",
+              commandText: "",
+              basePath: "",
+              status: "killed",
+              exitCode: -1,
+              durationMs: timeoutMs,
+              triggeredBy: "ai",
+              logFilePath: "",
+              startedAt: new Date().toISOString(),
+            }
+          );
+        }, timeoutMs);
+      });
+    };
+
+    const runBackgroundAdvisor = (advisorParams: {
+      messageId: string;
+      projectId: string | null;
+      projectName: string;
+      basePath: string;
+      engine: EngineType;
+      userGoal: string;
+      provider: ProviderConfig;
+    }) => {
+      void (async () => {
+        try {
+          if (get().chatSessionId !== sessionId) return;
+          const existingInStore = get()
+            .commands.filter((c) => c.projectId === advisorParams.projectId)
+            .flatMap((c) => [c.name, c.command]);
+
+          const suggestions = await runCommandAdvisorSubagent({
+            projectId: advisorParams.projectId,
+            projectName: advisorParams.projectName,
+            basePath: advisorParams.basePath,
+            engine: advisorParams.engine,
+            existingCommands: existingInStore,
+            userGoal: advisorParams.userGoal,
+            provider: advisorParams.provider,
+          });
+
+          if (get().chatSessionId !== sessionId) return;
+          if (suggestions.length > 0) {
+            set((s) => {
+              if (s.chatSessionId !== sessionId) return s;
+              if (!s.chatMessages.some((m) => m.id === advisorParams.messageId)) return s;
+              return {
+                chatMessages: s.chatMessages.map((m) =>
+                  m.id === advisorParams.messageId
+                    ? { ...m, suggestions, suggestionsLoading: false }
+                    : m
+                ),
+              };
+            });
+          }
+        } catch {
+          // Silently ignore 429 rate-limits, network errors, or aborts
+        } finally {
+          if (get().chatSessionId === sessionId) {
+            set((s) => {
+              if (s.chatSessionId !== sessionId) return s;
+              if (!s.chatMessages.some((m) => m.id === advisorParams.messageId)) return s;
+              return {
+                chatMessages: s.chatMessages.map((m) =>
+                  m.id === advisorParams.messageId && m.suggestionsLoading
+                    ? { ...m, suggestionsLoading: false }
+                    : m
+                ),
+              };
+            });
+            scheduleSessionPersist(get);
+          }
+        }
+      })();
+    };
 
     const toolCtx: ToolExecutionContext = {
       getState: () => {
@@ -1148,6 +1298,7 @@ export const useOmniStore = create<OmniStore>((set, get) => ({
           projects: s.projects,
           commands: s.commands,
           executions: s.executions,
+          engines: s.engines,
           selectedProjectId: s.selectedProjectId,
           agentPermissionMode: s.settings.agentPermissionMode,
           activeProvider: provider,
@@ -1162,6 +1313,7 @@ export const useOmniStore = create<OmniStore>((set, get) => ({
       updateCommand: (id, patch) => get().updateCommand(id, patch),
       deleteCommand: (id) => get().deleteCommand(id),
       executeCommand: (params) => get().executeDirect(params),
+      waitForExecution,
       requestApproval: (req) =>
         new Promise<boolean>((resolve) => {
           const item: PendingApproval = {
@@ -1192,6 +1344,36 @@ export const useOmniStore = create<OmniStore>((set, get) => ({
             aiDrawerOpen: true,
           }));
         }),
+      requestScaffoldApproval: (req) =>
+        new Promise<string[]>((resolve) => {
+          const item: PendingApproval = {
+            ...req,
+            id: `apr_${crypto.randomUUID().slice(0, 8)}`,
+            resolve: (res) => {
+              if (Array.isArray(res)) {
+                resolve(res);
+              } else {
+                resolve(res ? req.batchCommands.map((c) => c.id) : []);
+              }
+            },
+          };
+          set((s) => ({
+            pendingApprovals: [...s.pendingApprovals, item],
+            aiDrawerOpen: true,
+          }));
+        }),
+      requestSequenceApproval: (req) =>
+        new Promise<boolean>((resolve) => {
+          const item: PendingApproval = {
+            ...req,
+            id: `apr_${crypto.randomUUID().slice(0, 8)}`,
+            resolve: (res) => resolve(Boolean(res)),
+          };
+          set((s) => ({
+            pendingApprovals: [...s.pendingApprovals, item],
+            aiDrawerOpen: true,
+          }));
+        }),
       requestGlobalBasePath: (req) => get().requestGlobalBasePath(req),
       requestCommandVariables: (req) => get().requestCommandVariables(req),
       requestUserOptions: (req) =>
@@ -1210,8 +1392,10 @@ export const useOmniStore = create<OmniStore>((set, get) => ({
           aiLiveOptionCards: [...s.aiLiveOptionCards, card],
         }));
       },
-      onSuggestionsGenerated: (items) => {
-        set({ aiLiveSuggestions: items });
+      onTemplateExported: (tpl) => {
+        set((s) => ({
+          aiLiveExportedTemplates: [...s.aiLiveExportedTemplates, tpl],
+        }));
       },
     };
 
@@ -1222,6 +1406,7 @@ export const useOmniStore = create<OmniStore>((set, get) => ({
         mentions: resolvedMentions,
         provider: activeProvider,
         ctx: toolCtx,
+        signal: abortController.signal,
         onTraceUpdate: (traces) => set({ aiLiveTraces: traces }),
         onStreamText: (streamedText) => set({ aiStreamingText: streamedText }),
       });
@@ -1229,8 +1414,26 @@ export const useOmniStore = create<OmniStore>((set, get) => ({
       // Re-sync persisted projects & commands from storage to guarantee UI reflects durable state
       await get().refreshWorkspace();
 
+      // If user clicked New Chat while the turn was running, discard stale completion cleanly
+      if (get().chatSessionId !== sessionId) {
+        set({
+          activeAgentAbortController: null,
+          aiBusy: false,
+          aiLiveTraces: [],
+          aiStreamingText: "",
+          aiLiveOptionCards: [],
+          aiLiveSuggestions: [],
+          aiLiveExportedTemplates: [],
+          pendingOptionPrompt: null,
+        });
+        return;
+      }
+
+      const shouldRunAdvisor = Boolean(result.advisorTrigger) && !result.aborted;
+      const messageId = `msg_${crypto.randomUUID().slice(0, 8)}`;
+
       const assistantMsg: ChatMessage = {
-        id: `msg_${crypto.randomUUID().slice(0, 8)}`,
+        id: messageId,
         role: "assistant",
         content: result.text,
         timestamp: new Date().toISOString(),
@@ -1238,20 +1441,51 @@ export const useOmniStore = create<OmniStore>((set, get) => ({
         optionCards: result.optionCards.length > 0 ? result.optionCards : undefined,
         completionChips:
           result.completionChips.length > 0 ? result.completionChips : undefined,
-        suggestions: result.suggestions.length > 0 ? result.suggestions : undefined,
+        exportedTemplates:
+          result.exportedTemplates.length > 0 ? result.exportedTemplates : undefined,
+        suggestionsLoading: shouldRunAdvisor || undefined,
       };
 
       set((s) => ({
         chatMessages: [...s.chatMessages, assistantMsg],
+        activeAgentAbortController: null,
         aiBusy: false,
         aiLiveTraces: [],
         aiStreamingText: "",
         aiLiveOptionCards: [],
         aiLiveSuggestions: [],
+        aiLiveExportedTemplates: [],
         pendingOptionPrompt: null,
       }));
       scheduleSessionPersist(get);
+
+      // Fire Advisor Sub-Agent asynchronously in background without blocking the primary turn
+      if (shouldRunAdvisor && result.advisorTrigger) {
+        runBackgroundAdvisor({
+          messageId,
+          projectId: result.advisorTrigger.projectId,
+          projectName: result.advisorTrigger.projectName,
+          basePath: result.advisorTrigger.basePath,
+          engine: result.advisorTrigger.engine,
+          userGoal: result.advisorTrigger.userGoal,
+          provider: activeProvider,
+        });
+      }
     } catch (err) {
+      if (get().chatSessionId !== sessionId) {
+        set({
+          activeAgentAbortController: null,
+          aiBusy: false,
+          aiLiveTraces: [],
+          aiStreamingText: "",
+          aiLiveOptionCards: [],
+          aiLiveSuggestions: [],
+          aiLiveExportedTemplates: [],
+          pendingOptionPrompt: null,
+        });
+        return;
+      }
+
       const errText = err instanceof Error ? err.message : String(err);
       const errMsg: ChatMessage = {
         id: `msg_${crypto.randomUUID().slice(0, 8)}`,
@@ -1262,14 +1496,42 @@ export const useOmniStore = create<OmniStore>((set, get) => ({
       };
       set((s) => ({
         chatMessages: [...s.chatMessages, errMsg],
+        activeAgentAbortController: null,
         aiBusy: false,
         aiLiveTraces: [],
         aiStreamingText: "",
         aiLiveOptionCards: [],
         aiLiveSuggestions: [],
+        aiLiveExportedTemplates: [],
         pendingOptionPrompt: null,
       }));
       scheduleSessionPersist(get);
+    }
+  },
+
+  stopAgentTurn: () => {
+    const controller = get().activeAgentAbortController;
+    if (controller) {
+      controller.abort();
+    }
+
+    // Unblock any pending approval cards or option prompts cleanly when user hits Stop
+    const approvals = get().pendingApprovals;
+    if (approvals.length > 0) {
+      set({ pendingApprovals: [] });
+      for (const item of approvals) {
+        if (item.batchCommands && item.batchCommands.length > 0) {
+          item.resolve([]);
+        } else {
+          item.resolve(false);
+        }
+      }
+    }
+
+    const optPrompt = get().pendingOptionPrompt;
+    if (optPrompt) {
+      set({ pendingOptionPrompt: null });
+      optPrompt.resolve({ selectedIds: [], selectedLabels: [], cancelled: true });
     }
   },
 
@@ -1290,6 +1552,7 @@ export const useOmniStore = create<OmniStore>((set, get) => ({
       return;
     }
 
+    const sessionId = get().chatSessionId;
     set({ aiDrawerOpen: true, aiBusy: true });
 
     const lines = get().consoleLinesByExec[executionId];
@@ -1313,11 +1576,18 @@ export const useOmniStore = create<OmniStore>((set, get) => ({
         provider: activeProvider,
       });
 
+      if (get().chatSessionId !== sessionId) {
+        set({ aiBusy: false });
+        return;
+      }
+
+      const replyId = `msg_${crypto.randomUUID().slice(0, 8)}`;
       const reply: ChatMessage = {
-        id: `msg_${crypto.randomUUID().slice(0, 8)}`,
+        id: replyId,
         role: "assistant",
         content: analysis,
         timestamp: new Date().toISOString(),
+        suggestionsLoading: true,
         toolTraces: [
           {
             id: `trace_${crypto.randomUUID().slice(0, 8)}`,
@@ -1334,7 +1604,64 @@ export const useOmniStore = create<OmniStore>((set, get) => ({
         aiBusy: false,
       }));
       scheduleSessionPersist(get);
+
+      // Run background Advisor Sub-Agent for follow-up fix/diagnostic commands
+      const proj = execution.projectId
+        ? get().projects.find((p) => p.id === execution.projectId)
+        : null;
+      void (async () => {
+        try {
+          if (get().chatSessionId !== sessionId) return;
+          const existingInStore = get()
+            .commands.filter((c) => c.projectId === execution.projectId)
+            .flatMap((c) => [c.name, c.command]);
+
+          const suggestions = await runCommandAdvisorSubagent({
+            projectId: execution.projectId,
+            projectName: proj?.name ?? "Global Root",
+            basePath: proj?.basePath ?? execution.basePath,
+            engine: execution.engine,
+            existingCommands: existingInStore,
+            userGoal: `Fix or diagnose failed command "${execution.commandText}" (exit code ${execution.exitCode ?? "?"})`,
+            provider: activeProvider,
+          });
+
+          if (get().chatSessionId !== sessionId) return;
+          if (suggestions.length > 0) {
+            set((s) => {
+              if (s.chatSessionId !== sessionId) return s;
+              if (!s.chatMessages.some((m) => m.id === replyId)) return s;
+              return {
+                chatMessages: s.chatMessages.map((m) =>
+                  m.id === replyId ? { ...m, suggestions, suggestionsLoading: false } : m
+                ),
+              };
+            });
+          }
+        } catch {
+          // Silent fallback on 429 or transient error
+        } finally {
+          if (get().chatSessionId === sessionId) {
+            set((s) => {
+              if (s.chatSessionId !== sessionId) return s;
+              if (!s.chatMessages.some((m) => m.id === replyId)) return s;
+              return {
+                chatMessages: s.chatMessages.map((m) =>
+                  m.id === replyId && m.suggestionsLoading
+                    ? { ...m, suggestionsLoading: false }
+                    : m
+                ),
+              };
+            });
+            scheduleSessionPersist(get);
+          }
+        }
+      })();
     } catch (err) {
+      if (get().chatSessionId !== sessionId) {
+        set({ aiBusy: false });
+        return;
+      }
       const errReply: ChatMessage = {
         id: `msg_${crypto.randomUUID().slice(0, 8)}`,
         role: "assistant",
@@ -1350,14 +1677,19 @@ export const useOmniStore = create<OmniStore>((set, get) => ({
   },
 
   clearChatHistory: () => {
-    set({
+    get().stopAgentTurn();
+    set((s) => ({
+      chatSessionId: s.chatSessionId + 1,
+      activeAgentAbortController: null,
+      aiBusy: false,
       chatMessages: [],
       aiLiveTraces: [],
       aiStreamingText: "",
       aiLiveOptionCards: [],
       aiLiveSuggestions: [],
+      aiLiveExportedTemplates: [],
       pendingOptionPrompt: null,
-    });
+    }));
     scheduleSessionPersist(get);
   },
 }));

@@ -33,6 +33,38 @@ export default defineConfig(() => {
         '@': path.resolve(__dirname, '.'),
       },
     },
+    build: {
+      target: 'es2022',
+      sourcemap: false,
+      rollupOptions: {
+        // Guardrail: never bundle dev-only Express server or Node-only runtime modules into dist/
+        external: ['express', 'dotenv', path.resolve(__dirname, 'server.ts')],
+        output: {
+          manualChunks(id) {
+            if (!id.includes('node_modules')) return;
+            if (
+              id.includes('streamdown') ||
+              id.includes('shiki') ||
+              id.includes('@shikijs') ||
+              id.includes('remark') ||
+              id.includes('rehype') ||
+              id.includes('unified')
+            ) {
+              return 'markdown-shiki';
+            }
+            if (id.includes('@ai-sdk') || id.includes('/ai/')) {
+              return 'ai-sdk';
+            }
+            if (id.includes('lucide-react')) {
+              return 'icons';
+            }
+            if (id.includes('react-dom') || id.includes('/react/')) {
+              return 'react-vendor';
+            }
+          },
+        },
+      },
+    },
     server: {
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modify—file watching is disabled to prevent flickering during agent edits.

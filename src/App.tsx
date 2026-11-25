@@ -1,20 +1,45 @@
-import { useEffect } from "react";
+import { Suspense, lazy, useEffect, useRef } from "react";
 import { X } from "lucide-react";
 import { useOmniStore } from "./store/useOmniStore";
+import { runtimeBridge } from "./lib/bridge";
 import { Sidebar } from "./components/layout/Sidebar";
 import { WorkspaceHeader } from "./components/layout/WorkspaceHeader";
 import { CommandList } from "./components/commands/CommandList";
 import { AdHocBar } from "./components/commands/AdHocBar";
 import { EmbeddedConsole } from "./components/console/EmbeddedConsole";
 import { AiDrawer } from "./components/ai/AiDrawer";
-import { QuickLauncher } from "./components/launcher/QuickLauncher";
-import { ProjectModal } from "./components/modals/ProjectModal";
-import { CommandModal } from "./components/modals/CommandModal";
-import { BasePathPickerModal } from "./components/modals/BasePathPickerModal";
-import { ConfirmRunModal } from "./components/modals/ConfirmRunModal";
-import { VariablePromptModal } from "./components/modals/VariablePromptModal";
-import { ProviderSetupModal } from "./components/modals/ProviderSetupModal";
-import { SettingsModal } from "./components/settings/SettingsModal";
+
+// Lazy-load heavy overlays & modals so initial WebView2 cold-start render is instantaneous
+const QuickLauncher = lazy(() =>
+  import("./components/launcher/QuickLauncher").then((m) => ({ default: m.QuickLauncher }))
+);
+const ProjectModal = lazy(() =>
+  import("./components/modals/ProjectModal").then((m) => ({ default: m.ProjectModal }))
+);
+const CommandModal = lazy(() =>
+  import("./components/modals/CommandModal").then((m) => ({ default: m.CommandModal }))
+);
+const BasePathPickerModal = lazy(() =>
+  import("./components/modals/BasePathPickerModal").then((m) => ({
+    default: m.BasePathPickerModal,
+  }))
+);
+const ConfirmRunModal = lazy(() =>
+  import("./components/modals/ConfirmRunModal").then((m) => ({ default: m.ConfirmRunModal }))
+);
+const VariablePromptModal = lazy(() =>
+  import("./components/modals/VariablePromptModal").then((m) => ({
+    default: m.VariablePromptModal,
+  }))
+);
+const ProviderSetupModal = lazy(() =>
+  import("./components/modals/ProviderSetupModal").then((m) => ({
+    default: m.ProviderSetupModal,
+  }))
+);
+const SettingsModal = lazy(() =>
+  import("./components/settings/SettingsModal").then((m) => ({ default: m.SettingsModal }))
+);
 
 function isEditableElement(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
@@ -57,10 +82,15 @@ export default function App() {
   const launcherOpen = useOmniStore((s) => s.launcherOpen);
   const settingsOpen = useOmniStore((s) => s.settingsOpen);
   const providerSetupModalOpen = useOmniStore((s) => s.providerSetupModalOpen);
+  const projectModalOpen = useOmniStore((s) => s.projectModalState.open);
+  const commandModalOpen = useOmniStore((s) => s.commandModalState.open);
+  const basePathPickerOpen = useOmniStore((s) => Boolean(s.basePathPicker));
+  const confirmRunOpen = useOmniStore((s) => Boolean(s.confirmRunModal));
   const variablePromptOpen = useOmniStore((s) => Boolean(s.variablePromptModal));
   const setLauncherOpen = useOmniStore((s) => s.setLauncherOpen);
   const toasts = useOmniStore((s) => s.toasts);
   const dismissToast = useOmniStore((s) => s.dismissToast);
+  const revealedRef = useRef(false);
 
   useEffect(() => {
     let cleanup: (() => void) | undefined;
@@ -72,9 +102,23 @@ export default function App() {
     };
   }, [initialize]);
 
+  // Zero-flash cold start: once React hydrates initial state & theme, reveal the hidden
+  // Tauri "main" window and open the Quick Launcher if summoned via Shift+Space/tray.
+  useEffect(() => {
+    if (!initialized || revealedRef.current) return;
+    revealedRef.current = true;
+    requestAnimationFrame(() => {
+      void runtimeBridge.revealMainWindow().then((shouldOpenLauncher) => {
+        if (shouldOpenLauncher) {
+          setLauncherOpen(true);
+        }
+      });
+    });
+  }, [initialized, setLauncherOpen]);
+
   // Window-Focus Guard for Quick Launcher shortcut (Shift+Space default):
-  // Ignore Shift+Space whenever focus is inside any text input/textarea (e.g., AI chat or
-  // console stdin) so fast typing never accidentally toggles the Quick Launcher.
+  // Rust pauses the OS global hook while OmniCommand is focused; this listener handles
+  // Shift+Space inside the app while ignoring focus inside any <input>/<textarea>.
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (settingsOpen || providerSetupModalOpen || variablePromptOpen) return;
@@ -121,15 +165,17 @@ export default function App() {
       {/* Zone 3: Collapsible Right AI Assistant Drawer */}
       <AiDrawer />
 
-      {/* Floating Overlays & Modals */}
-      <QuickLauncher />
-      <ProjectModal />
-      <CommandModal />
-      <BasePathPickerModal />
-      <ConfirmRunModal />
-      <VariablePromptModal />
-      <ProviderSetupModal />
-      <SettingsModal />
+      {/* Lazy-Loaded Floating Overlays & Modals */}
+      <Suspense fallback={null}>
+        {launcherOpen && <QuickLauncher />}
+        {projectModalOpen && <ProjectModal />}
+        {commandModalOpen && <CommandModal />}
+        {basePathPickerOpen && <BasePathPickerModal />}
+        {confirmRunOpen && <ConfirmRunModal />}
+        {variablePromptOpen && <VariablePromptModal />}
+        {providerSetupModalOpen && <ProviderSetupModal />}
+        {settingsOpen && <SettingsModal />}
+      </Suspense>
 
       {/* Minimalist Toast Stack */}
       {toasts.length > 0 && (

@@ -1,6 +1,7 @@
 use crate::models::{
     AppSettings, CommandItem, EngineInfo, EngineType, ExecutionRecord, GuardrailCheckResult,
-    PathValidationResult, Project, SecretStatus, SessionState,
+    PathValidationResult, Project, SecretStatus, SessionState, WorkspaceFileEntry,
+    WorkspaceInspectionResult, WorkspaceManifestFile,
 };
 use crate::runner::{probe_available_engines, ProcessRunner};
 use crate::security::{
@@ -8,11 +9,25 @@ use crate::security::{
     validate_provider_url, SecretDecryptOutcome,
 };
 use crate::storage::AtomicJsonStore;
-use tauri::{AppHandle, State};
+use std::fs::{self, File};
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::{AppHandle, State, WebviewWindow};
 
 pub struct AppState {
     pub store: AtomicJsonStore,
     pub runner: ProcessRunner,
+    pub pending_open_launcher: AtomicBool,
+}
+
+/// Reveals the hidden main window once React finishes its initial mount
+/// (zero-flash cold start) and returns whether the Quick Launcher should open.
+#[tauri::command]
+pub fn reveal_main_window(window: WebviewWindow, state: State<'_, AppState>) -> bool {
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+    state.pending_open_launcher.swap(false, Ordering::SeqCst)
 }
 
 #[tauri::command]
@@ -88,9 +103,11 @@ pub fn get_settings(state: State<'_, AppState>) -> AppSettings {
 
 #[tauri::command]
 pub async fn save_settings(
+    app: AppHandle,
     state: State<'_, AppState>,
     mut settings: AppSettings,
 ) -> Result<AppSettings, String> {
+    let previous_shortcut = state.store.load_settings().launcher_shortcut;
     for provider in &mut settings.providers {
         if let Some(ref url) = provider.base_url {
             if !url.trim().is_empty() {
@@ -103,6 +120,9 @@ pub async fn save_settings(
         provider.secret_error = err;
     }
     state.store.save_settings(&settings).await?;
+    if settings.launcher_shortcut != previous_shortcut {
+        crate::rebind_global_shortcut(&app, &settings.launcher_shortcut);
+    }
     Ok(settings)
 }
 
@@ -246,4 +266,130 @@ pub fn list_available_engines() -> Vec<EngineInfo> {
 #[tauri::command]
 pub fn get_storage_root(state: State<'_, AppState>) -> String {
     state.store.root_dir().to_string_lossy().to_string()
+}
+
+const ALLOWED_MANIFEST_FILES: &[&str] = &[
+    "package.json",
+    "cargo.toml",
+    "pyproject.toml",
+    "requirements.txt",
+    "makefile",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "readme.md",
+];
+
+fn is_blocked_secret_filename(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    lower.starts_with(".env")
+        || lower.ends_with(".pem")
+        || lower.ends_with(".key")
+        || lower == "id_rsa"
+        || lower == "id_ed25519"
+        || lower.starts_with("credentials")
+        || lower == "settings.json"
+}
+
+fn is_allowed_manifest_filename(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    ALLOWED_MANIFEST_FILES.iter().any(|allowed| *allowed == lower)
+}
+
+#[tauri::command]
+pub fn inspect_workspace_files(
+    base_path: String,
+    manifest_file: Option<String>,
+) -> Result<WorkspaceInspectionResult, String> {
+    let check = validate_local_path(&base_path, true);
+    if !check.valid {
+        return Err(check
+            .blocked_reason
+            .unwrap_or_else(|| "Invalid or blocked project basePath.".to_string()));
+    }
+
+    let raw_canonical = check.canonical_path.unwrap_or(base_path);
+    let canonical_base = dunce::canonicalize(&raw_canonical)
+        .map_err(|e| format!("Unable to resolve project basePath: {e}"))?;
+
+    if !canonical_base.is_dir() {
+        return Err("Project basePath is not a directory.".to_string());
+    }
+
+    let mut entries: Vec<WorkspaceFileEntry> = Vec::new();
+    let dir_iter = fs::read_dir(&canonical_base)
+        .map_err(|e| format!("Failed reading workspace directory: {e}"))?;
+
+    for entry in dir_iter.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let blocked_secret = !is_dir && is_blocked_secret_filename(&name);
+        let readable_manifest = !is_dir && !blocked_secret && is_allowed_manifest_filename(&name);
+        entries.push(WorkspaceFileEntry {
+            name,
+            kind: if is_dir { "dir".to_string() } else { "file".to_string() },
+            readable_manifest,
+            blocked_secret,
+        });
+    }
+
+    entries.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    if entries.len() > 100 {
+        entries.truncate(100);
+    }
+
+    let manifest = if let Some(requested_raw) = manifest_file {
+        let requested = requested_raw.trim();
+        if requested.is_empty() {
+            None
+        } else {
+            if requested.contains("..") || requested.contains('/') || requested.contains('\\') {
+                return Err("Manifest filename must be a single top-level filename without path traversal.".to_string());
+            }
+            if is_blocked_secret_filename(requested) {
+                return Err(format!("Access denied: '{requested}' is blocked by secret-file guardrails."));
+            }
+            if !is_allowed_manifest_filename(requested) {
+                return Err(format!(
+                    "Unsupported manifest '{requested}'. Only safe top-level manifests (package.json, Cargo.toml, pyproject.toml, requirements.txt, Makefile, docker-compose.yml, README.md) may be read."
+                ));
+            }
+
+            let joined = canonical_base.join(requested);
+            let canonical_target = dunce::canonicalize(&joined)
+                .map_err(|e| format!("Manifest file '{requested}' not found or unreadable: {e}"))?;
+
+            // Symlink / NTFS junction escape guard
+            if !canonical_target.starts_with(&canonical_base) {
+                return Err("Path escapes project basePath".to_string());
+            }
+
+            let file = File::open(&canonical_target)
+                .map_err(|e| format!("Failed opening manifest '{requested}': {e}"))?;
+            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let truncated = file_len > 8192;
+
+            let mut buf = Vec::with_capacity(8192);
+            file.take(8192)
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("Failed reading manifest '{requested}': {e}"))?;
+
+            let raw_text = String::from_utf8_lossy(&buf).to_string();
+            let content = raw_text.strip_prefix('\u{FEFF}').unwrap_or(&raw_text).to_string();
+
+            Some(WorkspaceManifestFile {
+                filename: requested.to_string(),
+                content,
+                truncated,
+            })
+        }
+    } else {
+        None
+    };
+
+    Ok(WorkspaceInspectionResult {
+        base_path: canonical_base.to_string_lossy().to_string(),
+        entries,
+        manifest,
+        simulated: false,
+    })
 }

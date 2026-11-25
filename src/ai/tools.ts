@@ -4,8 +4,10 @@ import type {
   BatchApprovalCommandPreview,
   CommandItem,
   CompletionChip,
+  EngineInfo,
   EngineType,
   ExecutionRecord,
+  ExportedProjectTemplate,
   OptionChoiceItem,
   OptionPromptResponse,
   Project,
@@ -13,7 +15,8 @@ import type {
   ResolvedOptionCard,
   RiskLevel,
   RunPolicy,
-  SuggestedCommandItem,
+  ScaffoldProjectPreview,
+  SequenceStepPreview,
   VariablePromptItem,
 } from "../types/omnicommand";
 import { runtimeBridge } from "../lib/bridge";
@@ -24,7 +27,6 @@ import {
 } from "../lib/variables";
 import { evaluateToolPolicy } from "./policyGate";
 import { analyzeExecutionError } from "./errorAnalyzer";
-import { runCommandAdvisorSubagent } from "./commandAdvisorSubagent";
 import {
   TOOL_DESCRIPTIONS,
   TOOL_SCHEMAS,
@@ -33,11 +35,20 @@ import {
 
 export { TOOL_SCHEMAS, TOOL_DESCRIPTIONS, type OmniToolName };
 
+export interface AdvisorSignal {
+  projectId: string | null;
+  projectName: string;
+  basePath: string;
+  engine: EngineType;
+  reason: string;
+}
+
 export interface ToolExecutionContext {
   getState: () => {
     projects: Project[];
     commands: CommandItem[];
     executions: ExecutionRecord[];
+    engines: EngineInfo[];
     selectedProjectId: string | null;
     agentPermissionMode: AgentPermissionMode;
     activeProvider: ProviderConfig;
@@ -90,6 +101,7 @@ export interface ToolExecutionContext {
     projectId: string | null;
     triggeredBy: "ai";
   }) => Promise<ExecutionRecord>;
+  waitForExecution: (executionId: string) => Promise<ExecutionRecord>;
   requestApproval: (req: {
     toolName: string;
     title: string;
@@ -109,6 +121,26 @@ export interface ToolExecutionContext {
     details: Record<string, unknown>;
     batchCommands: BatchApprovalCommandPreview[];
   }) => Promise<string[]>;
+  requestScaffoldApproval: (req: {
+    toolName: string;
+    title: string;
+    basePath: string;
+    riskLevel: RiskLevel;
+    reason: string;
+    details: Record<string, unknown>;
+    scaffoldProject: ScaffoldProjectPreview;
+    batchCommands: BatchApprovalCommandPreview[];
+  }) => Promise<string[]>;
+  requestSequenceApproval: (req: {
+    toolName: string;
+    title: string;
+    basePath: string;
+    riskLevel: RiskLevel;
+    reason: string;
+    details: Record<string, unknown>;
+    sequenceSteps: SequenceStepPreview[];
+    stopOnError: boolean;
+  }) => Promise<boolean>;
   requestGlobalBasePath: (req: {
     title: string;
     commandName?: string;
@@ -145,11 +177,27 @@ export interface ToolExecutionContext {
   }) => void;
   onOptionCardResolved?: (card: ResolvedOptionCard) => void;
   onCompletionEvent?: (chip: CompletionChip) => void;
-  onSuggestionsGenerated?: (suggestions: SuggestedCommandItem[]) => void;
+  onTemplateExported?: (template: ExportedProjectTemplate) => void;
+  onAdvisorSignal?: (signal: AdvisorSignal) => void;
+}
+
+function normalizePathForCompare(p: string): string {
+  return p.trim().replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+}
+
+function takeOutputTail(rawLog: string, maxLines: number, maxChars: number): string {
+  if (!rawLog) return "";
+  const cleaned = rawLog.replace(/\x1b\[[0-9;]*m/g, "");
+  const lines = cleaned.split(/\r?\n/);
+  const tail = lines.slice(-maxLines).join("\n").trim();
+  if (tail.length > maxChars) {
+    return tail.slice(tail.length - maxChars);
+  }
+  return tail;
 }
 
 /**
- * Unified executor for all 16 OmniCommand AI tools, shared by both
+ * Unified executor for all 22 OmniCommand AI tools, shared by both
  * Vercel AI SDK (Tauri desktop) and the dev preview function-calling loop.
  * Never swallows tool errors — returns structured `{ success: false, error }`
  * and surfaces errors inline in the chat trace UI.
@@ -299,12 +347,193 @@ export async function executeOmniTool(
           label: `Project: ${project.name}`,
           projectId: project.id,
         });
+        ctx.onAdvisorSignal?.({
+          projectId: project.id,
+          projectName: project.name,
+          basePath: project.basePath,
+          engine: project.defaultEngine,
+          reason: `Created project "${project.name}"`,
+        });
         report("completed", `Created project "${project.name}" (${project.id})`);
         return {
           success: true,
           status: "created",
           projectId: project.id,
           project,
+        };
+      }
+
+      case "scaffold_project_with_commands": {
+        const parsed = TOOL_SCHEMAS.scaffold_project_with_commands.parse(rawArgs);
+        const pathCheck = await runtimeBridge.validatePath(parsed.basePath, false);
+        if (!pathCheck.valid) {
+          const reason = pathCheck.blockedReason ?? "Invalid or blocked basePath.";
+          report("error", reason, reason);
+          return { success: false, status: "blocked", error: reason };
+        }
+        const canonicalPath = pathCheck.canonicalPath ?? parsed.basePath.trim();
+
+        // Check for duplicate project name (case-insensitive) or canonical basePath BEFORE approval
+        const freshState = ctx.getState();
+        const nameLower = parsed.name.trim().toLowerCase();
+        const pathNorm = normalizePathForCompare(canonicalPath);
+        const duplicate = freshState.projects.find(
+          (p) =>
+            p.name.trim().toLowerCase() === nameLower ||
+            normalizePathForCompare(p.basePath) === pathNorm
+        );
+        if (duplicate) {
+          const err = `Project "${duplicate.name}" already exists at ${duplicate.basePath} (id: ${duplicate.id}). Use create_commands_batch with projectId "${duplicate.id}" to add commands to the existing project, or call ask_user_options to let the user choose.`;
+          report("error", `Duplicate project: ${duplicate.name}`, err);
+          return {
+            success: false,
+            status: "duplicate_project",
+            existingProject: {
+              id: duplicate.id,
+              name: duplicate.name,
+              basePath: duplicate.basePath,
+              defaultEngine: duplicate.defaultEngine,
+            },
+            error: err,
+          };
+        }
+
+        // Guardrail-check every starter command
+        for (const item of parsed.commands) {
+          const guardrail = await runtimeBridge.checkGuardrails(item.command);
+          if (guardrail.blocked) {
+            const reason = `Blocked command "${item.name}": ${guardrail.reason ?? "security guardrail"}`;
+            report("blocked", reason, reason);
+            return { success: false, status: "blocked", error: reason };
+          }
+        }
+
+        const highestRisk: RiskLevel = parsed.commands.some((c) => c.riskLevel === "high")
+          ? "high"
+          : parsed.commands.some((c) => c.riskLevel === "medium")
+            ? "medium"
+            : "low";
+
+        const normalizedItems = parsed.commands.map((item, idx) => ({
+          previewId: `scaf_${idx}_${crypto.randomUUID().slice(0, 6)}`,
+          name: item.name.trim(),
+          alias:
+            item.alias?.trim() ||
+            item.name
+              .trim()
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, "-"),
+          command: item.command.trim(),
+          engine: item.engine ?? parsed.defaultEngine,
+          riskLevel: item.riskLevel,
+          runPolicy: item.runPolicy,
+          aiAllowed: item.aiAllowed,
+          description: item.description?.trim() ?? "",
+        }));
+
+        const policy = evaluateToolPolicy({
+          toolName,
+          mode: freshState.agentPermissionMode,
+          riskLevel: highestRisk,
+        });
+
+        let approvedItems = normalizedItems;
+        let rejectedNames: string[] = [];
+
+        if (policy.decision === "ask") {
+          report(
+            "pending_approval",
+            `Scaffold Project "${parsed.name}" + ${normalizedItems.length} command(s)`
+          );
+          const approvedIds = await ctx.requestScaffoldApproval({
+            toolName,
+            title: `Create Project: ${parsed.name.trim()}`,
+            basePath: canonicalPath,
+            riskLevel: highestRisk,
+            reason: policy.reason,
+            details: parsed,
+            scaffoldProject: {
+              name: parsed.name.trim(),
+              basePath: canonicalPath,
+              defaultEngine: parsed.defaultEngine,
+            },
+            batchCommands: normalizedItems.map((i) => ({
+              id: i.previewId,
+              name: i.name,
+              alias: i.alias,
+              command: i.command,
+              engine: i.engine,
+              riskLevel: i.riskLevel,
+              description: i.description,
+            })),
+          });
+
+          const approvedSet = new Set(approvedIds);
+          approvedItems = normalizedItems.filter((i) => approvedSet.has(i.previewId));
+          rejectedNames = normalizedItems
+            .filter((i) => !approvedSet.has(i.previewId))
+            .map((i) => i.name);
+
+          if (approvedItems.length === 0) {
+            report("rejected", `Rejected project scaffold "${parsed.name}"`);
+            return {
+              success: false,
+              status: "rejected",
+              error: `User rejected scaffold_project_with_commands for "${parsed.name}".`,
+            };
+          }
+        }
+
+        report(
+          "running",
+          `Creating project "${parsed.name}" and ${approvedItems.length} command(s)...`
+        );
+        const project = await ctx.createProject({
+          name: parsed.name.trim(),
+          basePath: canonicalPath,
+          defaultEngine: parsed.defaultEngine,
+        });
+
+        const createdCommands = await ctx.createCommandsBatch({
+          projectId: project.id,
+          commands: approvedItems.map(({ previewId: _ignore, ...rest }) => rest),
+        });
+
+        ctx.onCompletionEvent?.({
+          id: `chip_proj_${project.id}`,
+          kind: "project",
+          label: `Project: ${project.name}`,
+          projectId: project.id,
+        });
+        for (const cmd of createdCommands) {
+          ctx.onCompletionEvent?.({
+            id: `chip_cmd_${cmd.id}`,
+            kind: "commands",
+            label: `Command: ${cmd.name}`,
+            projectId: project.id,
+            commandId: cmd.id,
+          });
+        }
+        ctx.onAdvisorSignal?.({
+          projectId: project.id,
+          projectName: project.name,
+          basePath: project.basePath,
+          engine: project.defaultEngine,
+          reason: `Scaffolded project "${project.name}" with ${createdCommands.length} commands`,
+        });
+
+        report(
+          "completed",
+          `Created "${project.name}" + ${createdCommands.length} command${createdCommands.length === 1 ? "" : "s"}${rejectedNames.length > 0 ? ` (${rejectedNames.length} skipped)` : ""}`
+        );
+        return {
+          success: true,
+          status: "created",
+          projectId: project.id,
+          project,
+          count: createdCommands.length,
+          commands: createdCommands,
+          ...(rejectedNames.length > 0 ? { rejectedCommands: rejectedNames } : {}),
         };
       }
 
@@ -460,6 +689,13 @@ export async function executeOmniTool(
           projectId: cmd.projectId,
           commandId: cmd.id,
         });
+        ctx.onAdvisorSignal?.({
+          projectId: targetProjectId,
+          projectName: targetProject?.name ?? "Global Root",
+          basePath: targetProject?.basePath ?? "",
+          engine: cmd.engine,
+          reason: `Added command "${cmd.name}"`,
+        });
         report("completed", `Saved command "${cmd.name}"`);
         return { success: true, status: "created", commandId: cmd.id, command: cmd };
       }
@@ -574,6 +810,14 @@ export async function executeOmniTool(
             commandId: cmd.id,
           });
         }
+
+        ctx.onAdvisorSignal?.({
+          projectId: targetProjectId,
+          projectName: targetProject?.name ?? "Global Root",
+          basePath: targetProject?.basePath ?? "",
+          engine: created[0]?.engine ?? targetProject?.defaultEngine ?? "powershell",
+          reason: `Added ${created.length} commands to ${targetProject?.name ?? "Global Root"}`,
+        });
 
         report(
           "completed",
@@ -963,59 +1207,482 @@ export async function executeOmniTool(
           rawOutput,
           provider: freshState.activeProvider,
         });
+        const targetProject = target.projectId
+          ? freshState.projects.find((p) => p.id === target.projectId)
+          : null;
+        ctx.onAdvisorSignal?.({
+          projectId: target.projectId,
+          projectName: targetProject?.name ?? "Global Root",
+          basePath: targetProject?.basePath ?? target.basePath,
+          engine: target.engine,
+          reason: `Analyzed failed execution "${target.commandText}" (exit ${target.exitCode ?? "?"})`,
+        });
         report("completed", `Analyzed error for ${target.id}`);
         return { success: true, executionId: target.id, exitCode: target.exitCode, analysis };
       }
 
-      case "suggest_next_commands": {
-        const parsed = TOOL_SCHEMAS.suggest_next_commands.parse(rawArgs);
+      case "inspect_workspace_files": {
+        const parsed = TOOL_SCHEMAS.inspect_workspace_files.parse(rawArgs);
         const freshState = ctx.getState();
 
-        const targetProjectId =
-          parsed.projectId === "global"
-            ? null
-            : parsed.projectId !== undefined
-              ? parsed.projectId
-              : freshState.selectedProjectId;
-        const matchedProject = targetProjectId
-          ? freshState.projects.find((p) => p.id === targetProjectId)
-          : freshState.projects.find(
-              (p) => p.name.toLowerCase() === parsed.projectName.toLowerCase()
-            );
+        const targetProject = parsed.projectId
+          ? freshState.projects.find((p) => p.id === parsed.projectId)
+          : !parsed.basePath && freshState.selectedProjectId
+            ? freshState.projects.find((p) => p.id === freshState.selectedProjectId)
+            : null;
 
-        const resolvedProjectId = matchedProject ? matchedProject.id : targetProjectId ?? null;
-        const existingInStore = freshState.commands
-          .filter((c) => c.projectId === resolvedProjectId)
-          .flatMap((c) => [c.name, c.command]);
-        const mergedExisting = Array.from(
-          new Set([...parsed.existingCommands, ...existingInStore])
-        );
-
-        report("running", `Consulting Advisor Sub-Agent for ${parsed.projectName}...`);
-        const suggestions = await runCommandAdvisorSubagent({
-          projectId: resolvedProjectId,
-          projectName: matchedProject?.name ?? parsed.projectName,
-          basePath: matchedProject?.basePath ?? parsed.basePath,
-          engine: parsed.engine ?? matchedProject?.defaultEngine ?? "powershell",
-          existingCommands: mergedExisting,
-          userGoal: parsed.userGoal,
-          provider: freshState.activeProvider,
-        });
-
-        if (suggestions.length > 0) {
-          ctx.onSuggestionsGenerated?.(suggestions);
+        const targetBasePath = targetProject?.basePath ?? parsed.basePath;
+        if (!targetBasePath) {
+          const err =
+            "No projectId or basePath provided and no active project is selected. Pass a valid projectId or Windows basePath.";
+          report("error", err, err);
+          return { success: false, status: "error", error: err };
         }
 
         report(
+          "running",
+          parsed.manifestFile
+            ? `Reading ${parsed.manifestFile} in ${targetProject?.name ?? targetBasePath}`
+            : `Inspecting workspace files in ${targetProject?.name ?? targetBasePath}`
+        );
+
+        const inspection = await runtimeBridge.inspectWorkspaceFiles({
+          basePath: targetBasePath,
+          manifestFile: parsed.manifestFile,
+          projectName: targetProject?.name,
+          defaultEngine: targetProject?.defaultEngine,
+        });
+
+        report(
           "completed",
-          suggestions.length > 0
-            ? `Generated ${suggestions.length} tailored suggestions`
-            : "No additional suggestions generated"
+          inspection.manifest
+            ? `Read ${inspection.manifest.filename}${inspection.manifest.truncated ? " (truncated at 8 KB)" : ""}`
+            : `Found ${inspection.entries.length} top-level item(s)`
         );
         return {
           success: true,
-          count: suggestions.length,
-          suggestions,
+          ...inspection,
+        };
+      }
+
+      case "run_command_sequence": {
+        const parsed = TOOL_SCHEMAS.run_command_sequence.parse(rawArgs);
+        const freshState = ctx.getState();
+
+        interface ResolvedSequenceStep {
+          stepIndex: number;
+          label: string;
+          commandText: string;
+          engine: EngineType;
+          basePath: string;
+          riskLevel: RiskLevel;
+          commandId: string | null;
+          projectId: string | null;
+          storedCommand?: CommandItem;
+        }
+
+        const resolvedSteps: ResolvedSequenceStep[] = [];
+        let sharedPickedBasePath: string | null = null;
+        let highestRisk: RiskLevel = "low";
+        let needsApproval = false;
+        let approvalReason = "Confirm multi-step command sequence before running.";
+
+        // Pre-resolve basePath and {var} placeholders across ALL steps BEFORE displaying the Sequence Approval Card
+        for (let i = 0; i < parsed.steps.length; i++) {
+          const step = parsed.steps[i];
+          const stored = step.commandId
+            ? freshState.commands.find((c) => c.id === step.commandId)
+            : undefined;
+
+          if (step.commandId && !stored) {
+            const err = `Step ${i + 1}: Stored command "${step.commandId}" not found.`;
+            report("error", err, err);
+            return { success: false, status: "error", error: err };
+          }
+
+          const rawTemplate = stored ? stored.command : step.commandText?.trim() ?? "";
+          if (!rawTemplate) {
+            const err = `Step ${i + 1}: Either commandId or commandText must be provided.`;
+            report("error", err, err);
+            return { success: false, status: "error", error: err };
+          }
+
+          const engine: EngineType = stored?.engine ?? step.engine ?? "powershell";
+          const riskLevel: RiskLevel = stored?.riskLevel ?? step.riskLevel ?? "low";
+          const label = step.label?.trim() || stored?.name || `Step ${i + 1}`;
+          const projectId = stored ? stored.projectId : freshState.selectedProjectId;
+
+          // Resolve basePath once (reuse picked directory across Global Root steps)
+          let stepBasePath = parsed.basePath;
+          if (!stepBasePath) {
+            if (stored?.projectId) {
+              stepBasePath = freshState.projects.find((p) => p.id === stored.projectId)?.basePath;
+            } else if (freshState.selectedProjectId) {
+              stepBasePath = freshState.projects.find(
+                (p) => p.id === freshState.selectedProjectId
+              )?.basePath;
+            }
+          }
+          if (!stepBasePath && sharedPickedBasePath) {
+            stepBasePath = sharedPickedBasePath;
+          }
+          if (!stepBasePath) {
+            report("pending_approval", `Select directory for sequence step ${i + 1}: ${label}`);
+            const picked = await ctx.requestGlobalBasePath({
+              title: `Select working directory for sequence (${parsed.steps.length} steps)`,
+              commandName: label,
+            });
+            if (!picked) {
+              report("cancelled", "User cancelled directory selection for command sequence");
+              return {
+                success: false,
+                status: "cancelled",
+                error: "User cancelled directory selection for run_command_sequence.",
+              };
+            }
+            sharedPickedBasePath = picked;
+            stepBasePath = picked;
+          }
+
+          // Pre-resolve {var} / {{var}} placeholders for this step
+          let finalCommand = rawTemplate;
+          const parsedVars = parseCommandVariables(rawTemplate);
+          if (parsedVars.length > 0) {
+            const provided = step.variables ?? {};
+            const missingRequired = parsedVars.some(
+              (v) => v.defaultValue === undefined && !(provided[v.name] ?? "").trim()
+            );
+
+            let resolvedValues: Record<string, string> = { ...provided };
+            if (missingRequired) {
+              report("pending_approval", `Awaiting variables for step ${i + 1}: ${label}`);
+              const prompted = await ctx.requestCommandVariables({
+                title: `Step ${i + 1} of ${parsed.steps.length}: Fill Command Variables`,
+                commandName: label,
+                commandTemplate: rawTemplate,
+                engine,
+                variables: parsedVars,
+                initialValues: provided,
+              });
+              if (!prompted) {
+                report("cancelled", `User cancelled variables for step ${i + 1}`);
+                return {
+                  success: false,
+                  status: "cancelled",
+                  error: `User cancelled variable input for sequence step ${i + 1} ("${label}").`,
+                };
+              }
+              resolvedValues = prompted;
+            } else {
+              saveLastVariableValues(resolvedValues);
+            }
+
+            finalCommand = interpolateCommandVariables(rawTemplate, resolvedValues);
+          }
+
+          // Guardrail-check the exact resolved command
+          const guardrail = await runtimeBridge.checkGuardrails(finalCommand);
+          if (guardrail.blocked) {
+            const reason = `Step ${i + 1} ("${label}") blocked by security guardrail: ${guardrail.reason ?? "blocked"}`;
+            report("blocked", reason, reason);
+            return { success: false, status: "blocked", error: reason };
+          }
+
+          // Policy check per step
+          const stepPolicy = evaluateToolPolicy({
+            toolName: stored ? "run_stored_command" : "run_adhoc_command",
+            mode: freshState.agentPermissionMode,
+            storedCommand: stored,
+            adhocCommandText: stored ? undefined : finalCommand,
+            resolvedCommandText: finalCommand,
+            riskLevel,
+          });
+          if (stepPolicy.decision === "block") {
+            const reason = `Step ${i + 1} ("${label}") blocked: ${stepPolicy.reason}`;
+            report("blocked", reason, reason);
+            return { success: false, status: "blocked", error: reason };
+          }
+          if (stepPolicy.decision === "ask") {
+            needsApproval = true;
+            approvalReason = stepPolicy.reason;
+          }
+
+          if (riskLevel === "high") {
+            highestRisk = "high";
+          } else if (riskLevel === "medium" && highestRisk !== "high") {
+            highestRisk = "medium";
+          }
+
+          resolvedSteps.push({
+            stepIndex: i + 1,
+            label,
+            commandText: finalCommand,
+            engine,
+            basePath: stepBasePath,
+            riskLevel,
+            commandId: stored?.id ?? null,
+            projectId,
+            storedCommand: stored,
+          });
+        }
+
+        // Single Sequence Approval Card showing exact pre-resolved commands
+        if (needsApproval) {
+          report("pending_approval", `Run sequence (${resolvedSteps.length} steps)`);
+          const approved = await ctx.requestSequenceApproval({
+            toolName,
+            title: `Run Sequence (${resolvedSteps.length} step${resolvedSteps.length === 1 ? "" : "s"})`,
+            basePath: resolvedSteps[0].basePath,
+            riskLevel: highestRisk,
+            reason: approvalReason,
+            details: {
+              stopOnError: parsed.stopOnError,
+              steps: resolvedSteps.map((s) => ({
+                stepIndex: s.stepIndex,
+                label: s.label,
+                commandText: s.commandText,
+                engine: s.engine,
+                basePath: s.basePath,
+              })),
+            },
+            sequenceSteps: resolvedSteps.map((s) => ({
+              stepIndex: s.stepIndex,
+              label: s.label,
+              commandText: s.commandText,
+              engine: s.engine,
+              basePath: s.basePath,
+              riskLevel: s.riskLevel,
+              commandId: s.commandId,
+            })),
+            stopOnError: parsed.stopOnError,
+          });
+
+          if (!approved) {
+            report("rejected", "User rejected command sequence");
+            return {
+              success: false,
+              status: "rejected",
+              error: "User rejected run_command_sequence.",
+            };
+          }
+        }
+
+        const stepResults: Array<{
+          stepIndex: number;
+          label: string;
+          executionId?: string;
+          status: string;
+          exitCode?: number | null;
+          durationMs?: number;
+          outputTail?: string;
+          reason?: string;
+        }> = [];
+        let lastExecutionId: string | null = null;
+        let abortedByKill = false;
+        let allSucceeded = true;
+
+        for (let i = 0; i < resolvedSteps.length; i++) {
+          const step = resolvedSteps[i];
+          report(
+            "running",
+            `Running step ${step.stepIndex}/${resolvedSteps.length}: ${step.label}`
+          );
+
+          const started = await ctx.executeCommand({
+            engine: step.engine,
+            commandText: step.commandText,
+            basePath: step.basePath,
+            commandId: step.commandId,
+            projectId: step.projectId,
+            triggeredBy: "ai",
+          });
+          lastExecutionId = started.id;
+
+          const finished = await ctx.waitForExecution(started.id);
+          const rawLog = await runtimeBridge.getExecutionLog(started.id);
+          const outputTail = takeOutputTail(rawLog, 30, 2400);
+
+          stepResults.push({
+            stepIndex: step.stepIndex,
+            label: step.label,
+            executionId: started.id,
+            status: finished.status,
+            exitCode: finished.exitCode,
+            durationMs: finished.durationMs,
+            outputTail,
+          });
+
+          // Immediately abort remaining steps if user killed the running step mid-sequence
+          if (finished.status === "killed") {
+            allSucceeded = false;
+            abortedByKill = true;
+            for (let j = i + 1; j < resolvedSteps.length; j++) {
+              stepResults.push({
+                stepIndex: resolvedSteps[j].stepIndex,
+                label: resolvedSteps[j].label,
+                status: "skipped",
+                reason: "Aborted because previous step was killed by user",
+              });
+            }
+            break;
+          }
+
+          const stepFailed =
+            finished.status === "failed" ||
+            finished.status === "blocked" ||
+            (finished.exitCode !== null && finished.exitCode !== 0);
+
+          if (stepFailed) {
+            allSucceeded = false;
+            if (parsed.stopOnError !== false) {
+              for (let j = i + 1; j < resolvedSteps.length; j++) {
+                stepResults.push({
+                  stepIndex: resolvedSteps[j].stepIndex,
+                  label: resolvedSteps[j].label,
+                  status: "skipped",
+                  reason: `Skipped because step ${step.stepIndex} failed (exit code ${finished.exitCode ?? "?"})`,
+                });
+              }
+              break;
+            }
+          }
+        }
+
+        const completedCount = stepResults.filter((r) => r.status === "completed").length;
+
+        if (lastExecutionId) {
+          ctx.onCompletionEvent?.({
+            id: `chip_seq_${lastExecutionId}`,
+            kind: "execution",
+            label: `Sequence: ${completedCount}/${resolvedSteps.length} passed`,
+            executionId: lastExecutionId,
+          });
+        }
+
+        if (abortedByKill) {
+          report(
+            "cancelled",
+            `Sequence aborted after kill (${completedCount}/${resolvedSteps.length} passed)`
+          );
+        } else {
+          report(
+            "completed",
+            `Sequence finished: ${completedCount}/${resolvedSteps.length} passed`
+          );
+        }
+
+        return {
+          success: allSucceeded,
+          status: abortedByKill ? "killed" : allSucceeded ? "completed" : "failed",
+          abortedByKill,
+          stopOnError: parsed.stopOnError,
+          completedSteps: completedCount,
+          totalSteps: resolvedSteps.length,
+          steps: stepResults,
+        };
+      }
+
+      case "search_execution_history": {
+        const parsed = TOOL_SCHEMAS.search_execution_history.parse(rawArgs);
+        const freshState = ctx.getState();
+
+        let filtered = freshState.executions;
+        if (parsed.projectId === "global") {
+          filtered = filtered.filter((e) => e.projectId === null);
+        } else if (parsed.projectId) {
+          filtered = filtered.filter((e) => e.projectId === parsed.projectId);
+        }
+        if (parsed.status) {
+          filtered = filtered.filter((e) => e.status === parsed.status);
+        }
+        if (parsed.engine) {
+          filtered = filtered.filter((e) => e.engine === parsed.engine);
+        }
+        if (parsed.query && parsed.query.trim()) {
+          const q = parsed.query.trim().toLowerCase();
+          filtered = filtered.filter(
+            (e) =>
+              e.commandText.toLowerCase().includes(q) || e.basePath.toLowerCase().includes(q)
+          );
+        }
+
+        const totalMatched = filtered.length;
+        const sliced = filtered.slice(0, parsed.limit);
+
+        const results = await Promise.all(
+          sliced.map(async (ex) => {
+            const raw = await runtimeBridge.getExecutionLog(ex.id);
+            return {
+              id: ex.id,
+              projectId: ex.projectId,
+              commandId: ex.commandId,
+              engine: ex.engine,
+              commandText: ex.commandText,
+              basePath: ex.basePath,
+              status: ex.status,
+              exitCode: ex.exitCode,
+              durationMs: ex.durationMs,
+              triggeredBy: ex.triggeredBy,
+              startedAt: ex.startedAt,
+              outputTail: takeOutputTail(raw, 8, 400),
+            };
+          })
+        );
+
+        report(
+          "completed",
+          `Found ${totalMatched} execution${totalMatched === 1 ? "" : "s"} (returned ${results.length})`
+        );
+        return {
+          success: true,
+          totalMatched,
+          returned: results.length,
+          results,
+        };
+      }
+
+      case "export_project_template": {
+        const parsed = TOOL_SCHEMAS.export_project_template.parse(rawArgs);
+        const freshState = ctx.getState();
+        const project = freshState.projects.find((p) => p.id === parsed.projectId);
+        if (!project) {
+          const err = `Project "${parsed.projectId}" not found.`;
+          report("error", err, err);
+          return { success: false, status: "not_found", error: err };
+        }
+
+        // Export ONLY portable project/command fields — strip machine-specific basePath, IDs, and secrets
+        const portableCommands = freshState.commands
+          .filter((c) => c.projectId === project.id)
+          .map((c) => ({
+            name: c.name,
+            alias: c.alias,
+            command: c.command,
+            engine: c.engine,
+            riskLevel: c.riskLevel,
+            runPolicy: c.runPolicy,
+            aiAllowed: c.aiAllowed,
+            description: c.description,
+          }));
+
+        const template: ExportedProjectTemplate = {
+          id: `tpl_${crypto.randomUUID().slice(0, 8)}`,
+          schemaVersion: "1.0",
+          projectName: project.name,
+          defaultEngine: project.defaultEngine,
+          exportedAt: new Date().toISOString(),
+          commands: portableCommands,
+        };
+
+        ctx.onTemplateExported?.(template);
+        report(
+          "completed",
+          `Exported template for "${project.name}" (${portableCommands.length} command${portableCommands.length === 1 ? "" : "s"})`
+        );
+        return {
+          success: true,
+          status: "exported",
+          template,
         };
       }
     }
@@ -1028,7 +1695,7 @@ export async function executeOmniTool(
 
 /**
  * Builds Vercel AI SDK v6 `tool(...)` registry for native Tauri desktop runs
- * (all 16 tools including `ask_user_options`).
+ * (all 22 primary tools; Advisor Sub-Agent runs asynchronously post-turn).
  */
 export function buildVercelAiTools(ctx: ToolExecutionContext) {
   return {
@@ -1041,6 +1708,11 @@ export function buildVercelAiTools(ctx: ToolExecutionContext) {
       description: TOOL_DESCRIPTIONS.create_project,
       inputSchema: TOOL_SCHEMAS.create_project,
       execute: (args) => executeOmniTool("create_project", args, ctx),
+    }),
+    scaffold_project_with_commands: tool({
+      description: TOOL_DESCRIPTIONS.scaffold_project_with_commands,
+      inputSchema: TOOL_SCHEMAS.scaffold_project_with_commands,
+      execute: (args) => executeOmniTool("scaffold_project_with_commands", args, ctx),
     }),
     update_project: tool({
       description: TOOL_DESCRIPTIONS.update_project,
@@ -1056,6 +1728,11 @@ export function buildVercelAiTools(ctx: ToolExecutionContext) {
       description: TOOL_DESCRIPTIONS.validate_local_path,
       inputSchema: TOOL_SCHEMAS.validate_local_path,
       execute: (args) => executeOmniTool("validate_local_path", args, ctx),
+    }),
+    inspect_workspace_files: tool({
+      description: TOOL_DESCRIPTIONS.inspect_workspace_files,
+      inputSchema: TOOL_SCHEMAS.inspect_workspace_files,
+      execute: (args) => executeOmniTool("inspect_workspace_files", args, ctx),
     }),
     list_commands: tool({
       description: TOOL_DESCRIPTIONS.list_commands,
@@ -1092,6 +1769,11 @@ export function buildVercelAiTools(ctx: ToolExecutionContext) {
       inputSchema: TOOL_SCHEMAS.run_adhoc_command,
       execute: (args) => executeOmniTool("run_adhoc_command", args, ctx),
     }),
+    run_command_sequence: tool({
+      description: TOOL_DESCRIPTIONS.run_command_sequence,
+      inputSchema: TOOL_SCHEMAS.run_command_sequence,
+      execute: (args) => executeOmniTool("run_command_sequence", args, ctx),
+    }),
     stop_execution: tool({
       description: TOOL_DESCRIPTIONS.stop_execution,
       inputSchema: TOOL_SCHEMAS.stop_execution,
@@ -1102,10 +1784,20 @@ export function buildVercelAiTools(ctx: ToolExecutionContext) {
       inputSchema: TOOL_SCHEMAS.get_execution_logs,
       execute: (args) => executeOmniTool("get_execution_logs", args, ctx),
     }),
+    search_execution_history: tool({
+      description: TOOL_DESCRIPTIONS.search_execution_history,
+      inputSchema: TOOL_SCHEMAS.search_execution_history,
+      execute: (args) => executeOmniTool("search_execution_history", args, ctx),
+    }),
     analyze_execution_error: tool({
       description: TOOL_DESCRIPTIONS.analyze_execution_error,
       inputSchema: TOOL_SCHEMAS.analyze_execution_error,
       execute: (args) => executeOmniTool("analyze_execution_error", args, ctx),
+    }),
+    export_project_template: tool({
+      description: TOOL_DESCRIPTIONS.export_project_template,
+      inputSchema: TOOL_SCHEMAS.export_project_template,
+      execute: (args) => executeOmniTool("export_project_template", args, ctx),
     }),
     list_available_engines: tool({
       description: TOOL_DESCRIPTIONS.list_available_engines,
@@ -1116,11 +1808,6 @@ export function buildVercelAiTools(ctx: ToolExecutionContext) {
       description: TOOL_DESCRIPTIONS.ask_user_options,
       inputSchema: TOOL_SCHEMAS.ask_user_options,
       execute: (args) => executeOmniTool("ask_user_options", args, ctx),
-    }),
-    suggest_next_commands: tool({
-      description: TOOL_DESCRIPTIONS.suggest_next_commands,
-      inputSchema: TOOL_SCHEMAS.suggest_next_commands,
-      execute: (args) => executeOmniTool("suggest_next_commands", args, ctx),
     }),
   };
 }
