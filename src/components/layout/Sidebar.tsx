@@ -8,7 +8,6 @@ import {
   Plus,
   Settings,
   Sun,
-  Terminal,
   Trash2,
 } from "lucide-react";
 import { useOmniStore } from "../../store/useOmniStore";
@@ -53,9 +52,14 @@ export function Sidebar() {
       {/* Brand header */}
       <div className="h-14 px-3.5 flex items-center justify-between gap-2 border-b border-[#E5E7EB] dark:border-[#262930]">
         <div className="flex items-center gap-2 shrink-0">
-          <div className="w-6 h-6 rounded-md bg-[#2563EB] flex items-center justify-center shrink-0">
-            <Terminal className="w-3.5 h-3.5 text-white" strokeWidth={2.2} />
-          </div>
+          <img
+            src="/logo.svg"
+            alt="OmniCommand"
+            width={24}
+            height={24}
+            draggable={false}
+            className="w-6 h-6 shrink-0 rounded-[5px]"
+          />
           <span className="text-[14px] font-semibold tracking-tight text-[#111827] dark:text-[#F3F4F6] whitespace-nowrap">
             OmniCommand
           </span>

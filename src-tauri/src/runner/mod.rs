@@ -116,7 +116,6 @@ impl ProcessRunner {
 
         #[cfg(target_os = "windows")]
         {
-            use std::os::windows::process::CommandExt;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
@@ -409,7 +408,8 @@ fn attach_to_kill_on_close_job(pid: u32) -> Result<WindowsJobHandle, String> {
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
 
     unsafe {
-        let job = CreateJobObjectW(None, None).map_err(|e| format!("CreateJobObjectW failed: {e}"))?;
+        let job = CreateJobObjectW(None, windows::core::PCWSTR::null())
+            .map_err(|e| format!("CreateJobObjectW failed: {e}"))?;
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
@@ -446,7 +446,6 @@ async fn terminate_process_tree(pid: Option<u32>) {
 
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
         let mut kill_cmd = Command::new("taskkill.exe");
         kill_cmd
             .args(["/F", "/T", "/PID", &pid.to_string()])
@@ -466,13 +465,16 @@ async fn terminate_process_tree(pid: Option<u32>) {
 }
 
 fn which_exists(binary: &str) -> bool {
-    std::process::Command::new("where")
-        .arg(binary)
+    let mut cmd = std::process::Command::new("where");
+    cmd.arg(binary)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stderr(Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.status().map(|s| s.success()).unwrap_or(false)
 }
 
 pub fn probe_available_engines() -> Vec<EngineInfo> {

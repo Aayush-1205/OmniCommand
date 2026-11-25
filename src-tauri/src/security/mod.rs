@@ -233,7 +233,7 @@ pub fn encrypt_secret_dpapi(plaintext: &str) -> Result<String, String> {
     unsafe {
         CryptProtectData(
             &in_blob,
-            None,
+            windows::core::PCWSTR::null(),
             None,
             None,
             None,
@@ -244,7 +244,7 @@ pub fn encrypt_secret_dpapi(plaintext: &str) -> Result<String, String> {
 
         let slice = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize);
         let encoded = BASE64.encode(slice);
-        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(out_blob.pbData as _));
+        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(out_blob.pbData.cast()));
         Ok(encoded)
     }
 }
@@ -287,7 +287,7 @@ pub fn decrypt_secret_dpapi(ciphertext_b64: Option<&str>) -> SecretDecryptOutcom
 
         let slice = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize);
         let result = String::from_utf8(slice.to_vec());
-        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(out_blob.pbData as _));
+        let _ = LocalFree(windows::Win32::Foundation::HLOCAL(out_blob.pbData.cast()));
 
         match result {
             Ok(secret) => SecretDecryptOutcome::Decrypted(secret),

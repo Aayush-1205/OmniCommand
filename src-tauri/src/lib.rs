@@ -20,9 +20,8 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 /// dropping background memory footprint to a minimal level.
 #[cfg(target_os = "windows")]
 fn trim_process_working_set() {
-    use windows::Win32::System::Memory::SetProcessWorkingSetSize;
     use windows::Win32::System::ProcessStatus::K32EmptyWorkingSet;
-    use windows::Win32::System::Threading::GetCurrentProcess;
+    use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
 
     unsafe {
         let process = GetCurrentProcess();
@@ -175,7 +174,10 @@ pub fn run() {
                     _ => {}
                 });
 
-            if let Some(icon) = app.default_window_icon().cloned() {
+            let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))
+                .ok()
+                .or_else(|| app.default_window_icon().cloned());
+            if let Some(icon) = tray_icon {
                 tray_builder = tray_builder.icon(icon);
             }
             let _tray = tray_builder.build(app)?;
@@ -259,6 +261,17 @@ pub fn run() {
             ipc::get_storage_root,
             ipc::inspect_workspace_files,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running OmniCommand");
+        .build(tauri::generate_context!())
+        .expect("error while building OmniCommand")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                if code.is_none() {
+                    if let Some(state) = app_handle.try_state::<AppState>() {
+                        if state.store.load_settings().close_to_tray {
+                            api.prevent_exit();
+                        }
+                    }
+                }
+            }
+        });
 }

@@ -22,7 +22,7 @@ An open-source, lightweight Windows 10/11 desktop command runner, project worksp
 1. **Rust MSVC Toolchain**: Install via [rustup.rs](https://rustup.rs/) with the `x86_64-pc-windows-msvc` target and **Visual Studio C++ Build Tools** ("Desktop development with C++" workload + Windows 10/11 SDK).
 2. **Node.js 20+ or Bun**: Required to install frontend dependencies and run the Vite production bundler (`npm` or `bun`).
 3. **Microsoft Edge WebView2 Runtime**: Pre-installed on Windows 11 and modern Windows 10; the NSIS/MSI installers also include the lightweight WebView2 download bootstrapper automatically.
-4. **Tauri CLI v2**: Install globally (`cargo install tauri-cli --version "^2"`) or run via `npx @tauri-apps/cli`.
+4. **Tauri CLI v2**: Included automatically in `devDependencies` (`@tauri-apps/cli`), so `npm run tauri:dev`, `npm run tauri:build`, and `npm run tauri:build:portable` work immediately after `npm install`.
 
 ### Commands
 
