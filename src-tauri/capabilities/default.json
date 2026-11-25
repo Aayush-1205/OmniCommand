@@ -1,0 +1,34 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Least-privilege capabilities for OmniCommand main window. Allows HTTPS and local loopback inference endpoints while explicitly blocking link-local metadata addresses (169.254.169.254).",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:window:allow-is-focused",
+    "core:window:allow-close",
+    "dialog:allow-open",
+    "global-shortcut:allow-register",
+    "global-shortcut:allow-unregister",
+    "global-shortcut:allow-is-registered",
+    {
+      "identifier": "http:default",
+      "allow": [
+        { "url": "https://**" },
+        { "url": "http://localhost:*" },
+        { "url": "http://localhost:*/**" },
+        { "url": "http://127.0.0.1:*" },
+        { "url": "http://127.0.0.1:*/**" }
+      ],
+      "deny": [
+        { "url": "http://169.254.169.254/**" },
+        { "url": "https://169.254.169.254/**" },
+        { "url": "http://169.254.*/**" },
+        { "url": "https://169.254.*/**" }
+      ]
+    }
+  ]
+}

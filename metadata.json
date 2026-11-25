@@ -1,0 +1,6 @@
+{
+  "name": "OmniCommand",
+  "description": "Minimalist Windows desktop AI-powered command runner, project workspace, and headless execution tracker.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

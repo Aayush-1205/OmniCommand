@@ -1,0 +1,178 @@
+@import "tailwindcss";
+@import "streamdown/styles.css";
+@source "../node_modules/streamdown/dist/*.js";
+@source "../node_modules/@streamdown/code/dist/*.js";
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --font-sans: "Segoe UI Variable", "Segoe UI", "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: "Cascadia Code", "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+
+  --bg-canvas: #FFFFFF;
+  --bg-surface: #F6F7F9;
+  --bg-elevated: #FFFFFF;
+  --border-subtle: #E5E7EB;
+  --text-primary: #111827;
+  --text-secondary: #6B7280;
+  --accent-primary: #2563EB;
+}
+
+.dark {
+  --bg-canvas: #111214;
+  --bg-surface: #181A1E;
+  --bg-elevated: #1E2026;
+  --border-subtle: #262930;
+  --text-primary: #F3F4F6;
+  --text-secondary: #9CA3AF;
+  --accent-primary: #2563EB;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  font-family: var(--font-sans);
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+.dark body {
+  letter-spacing: 0.005em;
+}
+
+code,
+pre,
+.font-mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Streamdown assistant prose & code blocks inside narrow right drawer */
+.omni-markdown {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-primary);
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.omni-markdown > * + * {
+  margin-top: 0.5rem;
+}
+
+.omni-markdown h1,
+.omni-markdown h2,
+.omni-markdown h3,
+.omni-markdown h4 {
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.35;
+  margin-top: 0.75rem;
+  margin-bottom: 0.25rem;
+}
+
+.omni-markdown h1 { font-size: 14.5px; }
+.omni-markdown h2 { font-size: 13.5px; }
+.omni-markdown h3,
+.omni-markdown h4 { font-size: 13px; }
+
+.omni-markdown p {
+  margin: 0;
+}
+
+.omni-markdown ul,
+.omni-markdown ol {
+  padding-left: 1.15rem;
+  margin: 0.25rem 0;
+}
+
+.omni-markdown li + li {
+  margin-top: 0.2rem;
+}
+
+.omni-markdown :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  padding: 0.1rem 0.3rem;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.06);
+  word-break: break-word;
+}
+
+.dark .omni-markdown :not(pre) > code {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.omni-markdown [data-streamdown="code-block"] {
+  max-width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-canvas);
+  overflow: hidden;
+  margin: 0.45rem 0;
+}
+
+.omni-markdown [data-streamdown="code-block-header"] {
+  padding: 0.35rem 0.65rem;
+  font-size: 11px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+}
+
+.omni-markdown pre {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 0.65rem 0.75rem;
+  margin: 0;
+  background: var(--bg-canvas);
+}
+
+.omni-markdown pre code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: pre;
+}
+
+/* Minimalist desktop scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(107, 114, 128, 0.28);
+  border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(107, 114, 128, 0.48);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
