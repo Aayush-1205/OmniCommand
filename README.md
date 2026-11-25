@@ -19,7 +19,7 @@ An open-source, lightweight Windows 10/11 desktop command runner, project worksp
 
 ### Prerequisites
 
-1. **Rust MSVC Toolchain**: Install via [rustup.rs](https://rustup.rs/) with the `x86_64-pc-windows-msvc` target and **Visual Studio C++ Build Tools** ("Desktop development with C++" workload + Windows 10/11 SDK).
+1. **Rust MSVC Toolchain (`cargo` & `rustc`)**: Install via `winget install --id Rustlang.Rustup -e` (or [rustup.rs](https://rustup.rs/)) with the `x86_64-pc-windows-msvc` target, plus **Visual Studio C++ Build Tools** (`winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`). Open a new terminal afterward so `%USERPROFILE%\.cargo\bin` is available.
 2. **Node.js 20+ or Bun**: Required to install frontend dependencies and run the Vite production bundler (`npm` or `bun`).
 3. **Microsoft Edge WebView2 Runtime**: Pre-installed on Windows 11 and modern Windows 10; the NSIS/MSI installers also include the lightweight WebView2 download bootstrapper automatically.
 4. **Tauri CLI v2**: Included automatically in `devDependencies` (`@tauri-apps/cli`), so `npm run tauri:dev`, `npm run tauri:build`, and `npm run tauri:build:portable` work immediately after `npm install`.
@@ -44,6 +44,25 @@ npm run tauri:build
 #    Outputs to: src-tauri/target/release/omnicommand.exe
 npm run tauri:build:portable
 ```
+
+### Cloud Build & GitHub Releases (No Local Rust Needed)
+
+The workflow in `.github/workflows/release-windows.yml` builds the Windows NSIS `.exe` installer, `.msi` installer, and standalone portable `OmniCommand_0.1.0_x64-portable.exe` on GitHub's `windows-latest` runner and publishes them to **GitHub Releases**:
+
+1. **Enable Release Permissions (one-time)**: On GitHub go to **Settings → Actions → General → Workflow permissions**, select **Read and write permissions**, and save.
+2. **Trigger `v0.1.0` Release**:
+   - **Via Git tag**:
+     ```bash
+     git add .
+     git commit -m "chore: release OmniCommand v0.1.0"
+     git tag v0.1.0
+     git push origin main --tags
+     ```
+   - **Or manually in GitHub UI**: Open **Actions → Build & Release Windows App → Run workflow** (defaults to `v0.1.0` from `package.json`).
+3. **Install on Windows**: Download `OmniCommand_0.1.0_x64-setup.exe` from **Releases**, or run:
+   ```bash
+   npm run install:latest-exe
+   ```
 
 ### Browser Preview (Development Only)
 

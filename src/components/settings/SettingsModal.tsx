@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { useOmniStore } from "../../store/useOmniStore";
 import { runtimeBridge } from "../../lib/bridge";
+import { APP_DISPLAY_VERSION } from "../../lib/version";
 import { validateProviderBaseUrl } from "../../lib/guardrails";
 import {
   isLocalLoopbackUrl,
@@ -260,9 +261,14 @@ export function SettingsModal() {
       >
         {/* Header */}
         <div className="px-5 h-12 border-b border-[#E5E7EB] dark:border-[#262930] flex items-center justify-between shrink-0">
-          <h2 className="text-[14px] font-semibold text-[#111827] dark:text-[#F3F4F6]">
-            Settings
-          </h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-[14px] font-semibold text-[#111827] dark:text-[#F3F4F6]">
+              Settings
+            </h2>
+            <span className="text-[11px] font-mono text-[#6B7280] dark:text-[#9CA3AF]">
+              {APP_DISPLAY_VERSION}
+            </span>
+          </div>
           <button
             type="button"
             onClick={() => {
@@ -278,33 +284,38 @@ export function SettingsModal() {
         {/* Body split */}
         <div className="flex-1 min-h-0 flex">
           {/* Left Tab Rail */}
-          <nav className="w-44 shrink-0 p-2.5 border-r border-[#E5E7EB] dark:border-[#262930] bg-[#F6F7F9] dark:bg-[#111214] space-y-1">
-            {(
-              [
-                { id: "general", label: "General & Tray", icon: Sliders },
-                { id: "shortcut", label: "Quick Launcher", icon: Keyboard },
-                { id: "providers", label: "AI Providers", icon: KeyRound },
-                { id: "engines", label: "Engines & Storage", icon: HardDrive },
-              ] as const
-            ).map((item) => {
-              const Icon = item.icon;
-              const active = tab === item.id;
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => setTab(item.id)}
-                  className={`w-full px-2.5 py-2 rounded-md text-[12.5px] font-medium flex items-center gap-2 transition-colors text-left cursor-pointer ${
-                    active
-                      ? "bg-[#2563EB]/12 text-[#2563EB] dark:text-[#60A5FA]"
-                      : "text-[#6B7280] dark:text-[#9CA3AF] hover:text-[#111827] dark:hover:text-[#F3F4F6] hover:bg-black/[0.04] dark:hover:bg-white/[0.04]"
-                  }`}
-                >
-                  <Icon className="w-3.5 h-3.5 shrink-0" />
-                  <span className="truncate">{item.label}</span>
-                </button>
-              );
-            })}
+          <nav className="w-44 shrink-0 p-2.5 border-r border-[#E5E7EB] dark:border-[#262930] bg-[#F6F7F9] dark:bg-[#111214] flex flex-col justify-between">
+            <div className="space-y-1">
+              {(
+                [
+                  { id: "general", label: "General & Tray", icon: Sliders },
+                  { id: "shortcut", label: "Quick Launcher", icon: Keyboard },
+                  { id: "providers", label: "AI Providers", icon: KeyRound },
+                  { id: "engines", label: "Engines & Storage", icon: HardDrive },
+                ] as const
+              ).map((item) => {
+                const Icon = item.icon;
+                const active = tab === item.id;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => setTab(item.id)}
+                    className={`w-full px-2.5 py-2 rounded-md text-[12.5px] font-medium flex items-center gap-2 transition-colors text-left cursor-pointer ${
+                      active
+                        ? "bg-[#2563EB]/12 text-[#2563EB] dark:text-[#60A5FA]"
+                        : "text-[#6B7280] dark:text-[#9CA3AF] hover:text-[#111827] dark:hover:text-[#F3F4F6] hover:bg-black/[0.04] dark:hover:bg-white/[0.04]"
+                    }`}
+                  >
+                    <Icon className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">{item.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="px-2.5 pt-3 border-t border-[#E5E7EB] dark:border-[#262930] text-[11px] font-mono text-[#6B7280] dark:text-[#9CA3AF]">
+              OmniCommand {APP_DISPLAY_VERSION}
+            </div>
           </nav>
 
           {/* Right Tab Content */}

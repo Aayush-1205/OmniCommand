@@ -4,8 +4,16 @@ import fs from 'fs';
 import path from 'path';
 import {defineConfig} from 'vite';
 
+const packageJson = JSON.parse(
+  fs.readFileSync(path.resolve(__dirname, 'package.json'), 'utf8')
+) as {version?: string};
+const appVersion = packageJson.version ?? '0.1.0';
+
 export default defineConfig(() => {
   return {
+    define: {
+      __APP_VERSION__: JSON.stringify(appVersion),
+    },
     plugins: [
       react(),
       tailwindcss(),

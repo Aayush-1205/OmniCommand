@@ -1,0 +1,125 @@
+name: Build & Release Windows App
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish compiled installers to GitHub Releases"
+        type: boolean
+        default: true
+      release_tag:
+        description: "Release tag override (leave blank to use v<package.json version>, e.g. v0.1.0)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows (.exe, .msi, portable)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Rust stable (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Resolve app version & release tag
+        id: meta
+        shell: pwsh
+        run: |
+          $pkg = Get-Content -Raw -Path package.json | ConvertFrom-Json
+          $version = $pkg.version
+          if ("${{ github.event_name }}" -eq "push" -and "${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+            $shouldRelease = "true"
+          } else {
+            $inputTag = "${{ inputs.release_tag }}".Trim()
+            $tag = if ($inputTag) { $inputTag } else { "v$version" }
+            $shouldRelease = "${{ inputs.publish_release }}"
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "should_release=$shouldRelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Resolved OmniCommand version=$version tag=$tag should_release=$shouldRelease"
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Verify TypeScript and Rust compilation
+        run: npm run check:all
+
+      - name: Build Windows installers (NSIS .exe & .msi) and release executable
+        run: npm run tauri:build
+
+      - name: Collect release binaries
+        shell: pwsh
+        run: |
+          $version = "${{ steps.meta.outputs.version }}"
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+
+          Get-ChildItem -Path "src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item $_.FullName -Destination "release-assets/" -Force
+          }
+          Get-ChildItem -Path "src-tauri/target/release/bundle/msi/*.msi" -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item $_.FullName -Destination "release-assets/" -Force
+          }
+
+          $portableSrc = "src-tauri/target/release/omnicommand.exe"
+          if (Test-Path $portableSrc) {
+            Copy-Item $portableSrc -Destination "release-assets/OmniCommand_${version}_x64-portable.exe" -Force
+          }
+
+          $files = Get-ChildItem -Path "release-assets"
+          if (-not $files) {
+            Write-Error "No Windows build artifacts found in release-assets/."
+            exit 1
+          }
+          $files | Format-Table Name, Length
+
+      - name: Upload Windows build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniCommand-${{ steps.meta.outputs.tag }}-windows-x64
+          path: release-assets/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: steps.meta.outputs.should_release == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $version = "${{ steps.meta.outputs.version }}"
+          $assets = (Get-ChildItem -Path "release-assets" | ForEach-Object { $_.FullName })
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists — updating assets..."
+            gh release upload $tag @assets --clobber
+          } else {
+            Write-Host "Creating new GitHub Release $tag..."
+            gh release create $tag @assets `
+              --title "OmniCommand $tag" `
+              --notes "OmniCommand v$version for Windows (x64). Includes the NSIS setup installer (.exe), Windows Installer (.msi), and standalone portable executable." `
+              --target "${{ github.sha }}"
+          }
